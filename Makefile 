@@ -1,0 +1,26 @@
+CC      = gcc
+CFLAGS  = -Wall -Wextra -Wpedantic -std=c11 -O2 -g -pthread
+LDFLAGS = -pthread
+
+SRCS    = object_graph.c test_graph.c
+OBJS    = $(SRCS:.c=.o)
+TARGET  = test_graph
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CC) $(LDFLAGS) -o $@ $^
+
+%.o: %.c object_graph.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+test: $(TARGET)
+	./$(TARGET)
+
+valgrind: $(TARGET)
+	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./$(TARGET)
+
+clean:
+	rm -f $(OBJS) $(TARGET) /tmp/pog_test.bin /tmp/pog_checklist.bin
+
+.PHONY: all test valgrind clean
