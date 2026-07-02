@@ -1,6 +1,7 @@
 CC      = gcc
-CFLAGS  = -Wall -Wextra -Wpedantic -std=c11 -O2 -g -pthread
-LDFLAGS = -pthread
+CFLAGS  = -Wall -Wextra -Wpedantic -std=c11 -O2 -g -pthread \
+          -fstack-protector-strong -fPIE -D_FORTIFY_SOURCE=3 -fstack-clash-protection
+LDFLAGS = -pthread -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack
 
 SRCS    = object_graph.c test_graph.c
 OBJS    = $(SRCS:.c=.o)

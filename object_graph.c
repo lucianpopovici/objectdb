@@ -94,13 +94,37 @@ static void txnrec_free_owned(TxnRec *r)
     free(r->old_str); r->old_str = NULL;
 }
 
+/* ============================================================
+ * Overflow-checked growth helpers
+ *
+ * Every dynamic array in this file grows by capacity doubling. On 64-bit
+ * these overflow checks are not reachable with realistic in-memory counts,
+ * but they're cheap and make every growth site uniformly safe against a
+ * future caller (or a 32-bit build) driving a count near SIZE_MAX.
+ * ============================================================ */
+
+static bool next_cap(size_t cap, size_t initial, size_t *out)
+{
+    if (cap == 0) { *out = initial; return true; }
+    return !__builtin_mul_overflow(cap, (size_t)2, out);
+}
+
+static bool mul_bytes(size_t count, size_t elem_size, size_t *out)
+{
+    return !__builtin_mul_overflow(count, elem_size, out);
+}
+
 static bool log_push(Store *s, TxnRec rec)
 {
     if (!s || !s->active_txn) { txnrec_free_owned(&rec); return true; }
     Txn *t = s->active_txn;
     if (t->count >= t->cap) {
-        size_t nc = t->cap ? t->cap * 2 : INITIAL_LOG_CAP;
-        TxnRec *a = realloc(t->log, nc * sizeof(*a));
+        size_t nc, bytes;
+        if (!next_cap(t->cap, INITIAL_LOG_CAP, &nc) ||
+            !mul_bytes(nc, sizeof(*t->log), &bytes)) {
+            txnrec_free_owned(&rec); return false;
+        }
+        TxnRec *a = realloc(t->log, bytes);
         if (!a) { txnrec_free_owned(&rec); return false; }
         t->log = a; t->cap = nc;
     }
@@ -162,8 +186,11 @@ static void free_transient(Object *o)
 static bool scratch_push(Object *view, Object *item)
 {
     if (view->vlist.scratch_count >= view->vlist.scratch_cap) {
-        size_t nc = view->vlist.scratch_cap ? view->vlist.scratch_cap * 2 : 8;
-        Object **a = realloc(view->vlist.scratch, nc * sizeof(*a));
+        size_t nc, bytes;
+        if (!next_cap(view->vlist.scratch_cap, 8, &nc) ||
+            !mul_bytes(nc, sizeof(*view->vlist.scratch), &bytes))
+            return false;
+        Object **a = realloc(view->vlist.scratch, bytes);
         if (!a) return false;
         view->vlist.scratch = a;
         view->vlist.scratch_cap = nc;
@@ -210,11 +237,17 @@ Object *pog_vlist_emit_string(Object *view, const char *v)
 static bool class_ensure_cap(Store *s)
 {
     if (s->class_count < s->class_capacity) return true;
-    size_t nc = s->class_capacity ? s->class_capacity * 2 : 8;
-    char    **nn = realloc(s->class_names,     nc * sizeof(*nn));
-    Object ***ni = realloc(s->class_instances, nc * sizeof(*ni));
-    size_t   *nco = realloc(s->class_counts,   nc * sizeof(*nco));
-    size_t   *nca = realloc(s->class_caps,     nc * sizeof(*nca));
+    size_t nc, b_nn, b_ni, b_nco, b_nca;
+    if (!next_cap(s->class_capacity, 8, &nc) ||
+        !mul_bytes(nc, sizeof(*s->class_names),     &b_nn)  ||
+        !mul_bytes(nc, sizeof(*s->class_instances),  &b_ni)  ||
+        !mul_bytes(nc, sizeof(*s->class_counts),     &b_nco) ||
+        !mul_bytes(nc, sizeof(*s->class_caps),       &b_nca))
+        return false;
+    char    **nn = realloc(s->class_names,     b_nn);
+    Object ***ni = realloc(s->class_instances, b_ni);
+    size_t   *nco = realloc(s->class_counts,   b_nco);
+    size_t   *nca = realloc(s->class_caps,     b_nca);
     if (!nn || !ni || !nco || !nca) {
         /* realloc may succeed for some but not others; those that did are
          * still valid under their pointers; leak the partial grow for now
@@ -265,8 +298,11 @@ static size_t class_get_or_create(Store *s, const char *name)
 static bool class_list_append(Store *s, size_t idx, Object *o)
 {
     if (s->class_counts[idx] >= s->class_caps[idx]) {
-        size_t nc = s->class_caps[idx] ? s->class_caps[idx] * 2 : 8;
-        Object **a = realloc(s->class_instances[idx], nc * sizeof(*a));
+        size_t nc, bytes;
+        if (!next_cap(s->class_caps[idx], 8, &nc) ||
+            !mul_bytes(nc, sizeof(*s->class_instances[idx]), &bytes))
+            return false;
+        Object **a = realloc(s->class_instances[idx], bytes);
         if (!a) return false;
         s->class_instances[idx] = a;
         s->class_caps[idx] = nc;
@@ -308,15 +344,22 @@ static void class_index_rebuild(Store *s)
     }
 }
 
-static void store_push_obj(Store *s, Object *o)
+/* Returns false (o not stored) on allocation failure — caller owns o and
+ * must free it. An embeddable library must let the host handle OOM rather
+ * than abort() the whole process out from under it. */
+static bool store_push_obj(Store *s, Object *o)
 {
     if (s->count >= s->capacity) {
-        size_t nc = s->capacity * 2;
-        Object **a = realloc(s->objects, nc * sizeof(*a));
-        if (!a) abort();
+        size_t nc, bytes;
+        if (!next_cap(s->capacity, INITIAL_OBJ_CAP, &nc) ||
+            !mul_bytes(nc, sizeof(*s->objects), &bytes))
+            return false;
+        Object **a = realloc(s->objects, bytes);
+        if (!a) return false;
         s->objects = a; s->capacity = nc;
     }
     s->objects[s->count++] = o;
+    return true;
 }
 
 static Object *alloc_with_id(Store *s, ObjectKind kind, uint32_t id)
@@ -324,7 +367,7 @@ static Object *alloc_with_id(Store *s, ObjectKind kind, uint32_t id)
     Object *o = calloc(1, sizeof(*o));
     if (!o) return NULL;
     o->id = id; o->kind = kind; o->store = s;
-    store_push_obj(s, o);
+    if (!store_push_obj(s, o)) { free(o); return NULL; }
     if (id >= s->next_id) s->next_id = id + 1;
     return o;
 }
@@ -364,8 +407,11 @@ static Field *find_field(Object *o, const char *key)
 static bool composite_grow(Object *o)
 {
     if (o->composite.count < o->composite.cap) return true;
-    size_t nc = o->composite.cap ? o->composite.cap * 2 : INITIAL_FIELD_CAP;
-    Field *a = realloc(o->composite.items, nc * sizeof(*a));
+    size_t nc, bytes;
+    if (!next_cap(o->composite.cap, INITIAL_FIELD_CAP, &nc) ||
+        !mul_bytes(nc, sizeof(*o->composite.items), &bytes))
+        return false;
+    Field *a = realloc(o->composite.items, bytes);
     if (!a) return false;
     o->composite.items = a; o->composite.cap = nc;
     return true;
@@ -374,8 +420,11 @@ static bool composite_grow(Object *o)
 static bool list_grow(Object *l)
 {
     if (l->list.count < l->list.cap) return true;
-    size_t nc = l->list.cap ? l->list.cap * 2 : INITIAL_LIST_CAP;
-    Object **a = realloc(l->list.items, nc * sizeof(*a));
+    size_t nc, bytes;
+    if (!next_cap(l->list.cap, INITIAL_LIST_CAP, &nc) ||
+        !mul_bytes(nc, sizeof(*l->list.items), &bytes))
+        return false;
+    Object **a = realloc(l->list.items, bytes);
     if (!a) return false;
     l->list.items = a; l->list.cap = nc;
     return true;
@@ -565,10 +614,12 @@ static Object *new_string_unlocked(Store *s, const char *v)
     Object *o = alloc_object(s, OBJ_STRING);
     if (!o) { auto_end(s, started, false); return NULL; }
     o->str_value = strdup(v ? v : "");
+    if (!o->str_value) { auto_end(s, started, false); return NULL; }
 
     TxnRec r = {0};
     r.op = WOP_NEW_STRING; r.target = o; r.target_id = o->id;
     r.new_str = strdup(v ? v : "");
+    if (!r.new_str) { auto_end(s, started, false); return NULL; }
     r.is_create = true;
     log_push(s, r);
 
@@ -883,17 +934,25 @@ static bool pset_has(PtrSet *p, Object *o)
 static void pset_add(PtrSet *p, Object *o)
 {
     if (p->count >= p->cap) {
-        size_t nc = p->cap ? p->cap * 2 : 16;
-        Object **a = realloc(p->items, nc * sizeof(*a));
+        size_t nc, bytes;
+        if (!next_cap(p->cap, 16, &nc) || !mul_bytes(nc, sizeof(*p->items), &bytes))
+            return;
+        Object **a = realloc(p->items, bytes);
         if (!a) return;
         p->items = a; p->cap = nc;
     }
     p->items[p->count++] = o;
 }
 
-static void dump_rec(Object *o, PtrSet *v)
+/* Debug-only, but still driven by graph shape (possibly loaded from a
+ * crafted/deep snapshot), so recursion depth must be bounded the same way
+ * mark_from() bounds it via an explicit worklist. */
+#define DUMP_MAX_DEPTH 1000
+
+static void dump_rec(Object *o, PtrSet *v, int depth)
 {
     if (!o)                  { printf("<null>");              return; }
+    if (depth >= DUMP_MAX_DEPTH) { printf("<max depth>");      return; }
     if (pset_has(v, o))      { printf("<cycle to #%u>", o->id); return; }
     pset_add(v, o);
 
@@ -904,7 +963,7 @@ static void dump_rec(Object *o, PtrSet *v)
         printf("#%u[", o->id);
         for (size_t i = 0; i < o->list.count; i++) {
             if (i) printf(", ");
-            dump_rec(o->list.items[i], v);
+            dump_rec(o->list.items[i], v, depth + 1);
         }
         printf("]");
         break;
@@ -916,7 +975,7 @@ static void dump_rec(Object *o, PtrSet *v)
         for (size_t i = 0; i < limit; i++) {
             if (i) printf(", ");
             Object *it = o->vlist.ops->at(o, i);
-            dump_rec(it, v);
+            dump_rec(it, v, depth + 1);
         }
         if (n > 10) printf(", ... (%zu more)", n - 10);
         printf("]");
@@ -927,7 +986,7 @@ static void dump_rec(Object *o, PtrSet *v)
         for (size_t i = 0; i < o->composite.count; i++) {
             if (i) printf(", ");
             printf("%s: ", o->composite.items[i].key);
-            dump_rec(o->composite.items[i].value, v);
+            dump_rec(o->composite.items[i].value, v, depth + 1);
         }
         printf("}");
         break;
@@ -943,7 +1002,7 @@ void dump(Object *o)
         took_lock = true;
     }
     PtrSet v = {0};
-    dump_rec(o, &v);
+    dump_rec(o, &v, 0);
     printf("\n");
     free(v.items);
     if (took_lock) pthread_rwlock_unlock(&s->lock);
@@ -963,7 +1022,7 @@ void dump_store(Store *s)
         if (!s->roots[i].used) continue;
         printf("  %s -> ", s->roots[i].name);
         PtrSet v = {0};
-        dump_rec(s->roots[i].obj, &v);
+        dump_rec(s->roots[i].obj, &v, 0);
         printf("\n");
         free(v.items);
     }
@@ -974,19 +1033,52 @@ void dump_store(Store *s)
  * GC
  * ============================================================ */
 
-static void mark(Object *o)
+/* Explicit heap worklist, not the call stack — a deep chain of composites
+ * or lists (e.g. loaded from a crafted or merely large snapshot) must not
+ * blow the C stack via per-edge recursion. */
+typedef struct { Object **items; size_t count, cap; } MarkStack;
+
+static bool mark_stack_push(MarkStack *ms, Object *o)
 {
-    if (!o || o->marked) return;
-    o->marked = true;
-    if (o->kind == OBJ_COMPOSITE) {
-        for (size_t i = 0; i < o->composite.count; i++)
-            mark(o->composite.items[i].value);
-    } else if (o->kind == OBJ_LIST) {
-        for (size_t i = 0; i < o->list.count; i++)
-            mark(o->list.items[i]);
-    } else if (o->kind == OBJ_VLIST) {
-        mark(o->vlist.params);
+    if (ms->count >= ms->cap) {
+        size_t nc, bytes;
+        if (!next_cap(ms->cap, 256, &nc) || !mul_bytes(nc, sizeof(*ms->items), &bytes))
+            return false;
+        Object **a = realloc(ms->items, bytes);
+        if (!a) return false;
+        ms->items = a; ms->cap = nc;
     }
+    ms->items[ms->count++] = o;
+    return true;
+}
+
+/* Mark everything reachable from root. Returns false on OOM mid-traversal —
+ * the caller must not sweep in that case, since incomplete marking would
+ * free still-reachable objects. */
+static bool mark_from(MarkStack *ms, Object *root)
+{
+    if (!root || root->marked) return true;
+    if (!mark_stack_push(ms, root)) return false;
+    while (ms->count > 0) {
+        Object *o = ms->items[--ms->count];
+        if (o->marked) continue;
+        o->marked = true;
+        if (o->kind == OBJ_COMPOSITE) {
+            for (size_t i = 0; i < o->composite.count; i++) {
+                Object *c = o->composite.items[i].value;
+                if (c && !c->marked && !mark_stack_push(ms, c)) return false;
+            }
+        } else if (o->kind == OBJ_LIST) {
+            for (size_t i = 0; i < o->list.count; i++) {
+                Object *c = o->list.items[i];
+                if (c && !c->marked && !mark_stack_push(ms, c)) return false;
+            }
+        } else if (o->kind == OBJ_VLIST) {
+            if (o->vlist.params && !o->vlist.params->marked &&
+                !mark_stack_push(ms, o->vlist.params)) return false;
+        }
+    }
+    return true;
 }
 
 static void gc_unlocked(Store *s)
@@ -997,8 +1089,17 @@ static void gc_unlocked(Store *s)
         return;
     }
     for (size_t i = 0; i < s->count; i++) s->objects[i]->marked = false;
-    for (size_t i = 0; i < s->root_count; i++)
-        if (s->roots[i].used) mark(s->roots[i].obj);
+
+    MarkStack ms = {0};
+    bool ok = true;
+    for (size_t i = 0; i < s->root_count && ok; i++)
+        if (s->roots[i].used) ok = mark_from(&ms, s->roots[i].obj);
+    free(ms.items);
+
+    if (!ok) {
+        fprintf(stderr, "pog: gc() aborted — out of memory during mark\n");
+        return;
+    }
 
     size_t w = 0;
     for (size_t r = 0; r < s->count; r++) {
@@ -1117,17 +1218,24 @@ bool save(Store *s, const char *path)
 
 /* id-map for load/replay */
 typedef struct { Object **items; uint32_t cap; } IdMap;
-static void idmap_put(IdMap *m, uint32_t id, Object *o)
+/* Returns false on allocation failure instead of aborting the process. */
+static bool idmap_put(IdMap *m, uint32_t id, Object *o)
 {
     if (id >= m->cap) {
-        uint32_t nc = m->cap ? m->cap : 64;
+        /* widen to 64-bit for the doubling loop: id can be up to UINT32_MAX,
+         * and doubling a uint32_t past it would wrap and spin forever. */
+        uint64_t nc = m->cap ? m->cap : 64;
         while (nc <= id) nc *= 2;
-        Object **a = realloc(m->items, nc * sizeof(*a));
-        if (!a) abort();
-        memset(a + m->cap, 0, (nc - m->cap) * sizeof(*a));
-        m->items = a; m->cap = nc;
+        if (nc > UINT32_MAX) return false;
+        size_t bytes;
+        if (!mul_bytes((size_t)nc, sizeof(*m->items), &bytes)) return false;
+        Object **a = realloc(m->items, bytes);
+        if (!a) return false;
+        memset(a + m->cap, 0, (size_t)(nc - m->cap) * sizeof(*a));
+        m->items = a; m->cap = (uint32_t)nc;
     }
     m->items[id] = o;
+    return true;
 }
 static Object *idmap_get(IdMap *m, uint32_t id)
 {
@@ -1142,16 +1250,38 @@ typedef struct {
     Object *list; uint32_t target_id;
 } PendListItem;
 
+/* Reject a claimed element count that can't possibly fit in the bytes left
+ * in the file — guards calloc(count, ...) sites against a crafted/corrupt
+ * file claiming millions of elements it doesn't actually contain. */
+#define MIN_OBJ_BYTES   5   /* u32 id + u8 kind */
+#define MIN_FIELD_BYTES 8   /* min r_str(key) + u32 tid */
+#define MIN_LIST_BYTES  4   /* u32 tid */
+#define MIN_ROOT_BYTES  8   /* min r_str(name) + u32 oid */
+
+static bool count_fits_remaining(long fsize, long pos, uint32_t count,
+                                  size_t min_elem_size)
+{
+    if (fsize < 0 || pos < 0 || pos > fsize) return false;
+    unsigned long long remaining = (unsigned long long)(fsize - pos);
+    return (unsigned long long)count * (unsigned long long)min_elem_size
+           <= remaining;
+}
+
 Store *load(const char *path)
 {
     if (!path) return NULL;
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
 
+    long fsize = -1;
+    if (fseek(f, 0, SEEK_END) == 0) fsize = ftell(f);
+    if (fsize < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+
     uint32_t magic, ver, seq, next_id, nobj;
     if (!r_u32(f,&magic) || magic != POGE_MAGIC ||
         !r_u32(f,&ver)   || ver   != POGE_VERSION ||
-        !r_u32(f,&seq)   || !r_u32(f,&next_id) || !r_u32(f,&nobj)) {
+        !r_u32(f,&seq)   || !r_u32(f,&next_id) || !r_u32(f,&nobj) ||
+        !count_fits_remaining(fsize, ftell(f), nobj, MIN_OBJ_BYTES)) {
         fclose(f); return NULL;
     }
 
@@ -1187,7 +1317,10 @@ Store *load(const char *path)
             if (*cname) o->class_name = cname;
             else        { free(cname); o->class_name = NULL; }
             uint32_t nf;
-            if (!r_u32(f, &nf)) { free_object(o); ok = false; break; }
+            if (!r_u32(f, &nf) ||
+                !count_fits_remaining(fsize, ftell(f), nf, MIN_FIELD_BYTES)) {
+                free_object(o); ok = false; break;
+            }
             o->composite.items = calloc(nf > 0 ? nf : 1, sizeof(Field));
             if (!o->composite.items) { free_object(o); ok = false; break; }
             o->composite.cap   = nf > 0 ? nf : 1;
@@ -1199,21 +1332,28 @@ Store *load(const char *path)
                 o->composite.items[j].key[POG_MAX_KEY_LEN - 1] = '\0';
                 free(key);
                 if (pfc >= pfcap) {
-                    pfcap = pfcap ? pfcap * 2 : 16;
-                    PendField *np = realloc(pf, pfcap * sizeof(*np));
+                    size_t nc, bytes;
+                    if (!next_cap(pfcap, 16, &nc) || !mul_bytes(nc, sizeof(*pf), &bytes)) {
+                        ok = false; break;
+                    }
+                    PendField *np = realloc(pf, bytes);
                     if (!np) { ok = false; break; }
-                    pf = np;
+                    pf = np; pfcap = nc;
                 }
                 pf[pfc].owner = o;
                 pf[pfc].key = strdup(o->composite.items[j].key);
                 pf[pfc].target_id = tid;
                 pfc++;
             }
+            if (!ok) free_object(o);   /* not yet store_push_obj'd */
             break;
         }
         case OBJ_LIST: {
             uint32_t nl;
-            if (!r_u32(f, &nl)) { free_object(o); ok = false; break; }
+            if (!r_u32(f, &nl) ||
+                !count_fits_remaining(fsize, ftell(f), nl, MIN_LIST_BYTES)) {
+                free_object(o); ok = false; break;
+            }
             o->list.items = calloc(nl > 0 ? nl : 1, sizeof(Object *));
             if (!o->list.items) { free_object(o); ok = false; break; }
             o->list.cap   = nl > 0 ? nl : 1;
@@ -1222,10 +1362,13 @@ Store *load(const char *path)
                 uint32_t tid;
                 if (!r_u32(f, &tid)) { ok = false; break; }
                 if (plc >= plcap) {
-                    plcap = plcap ? plcap * 2 : 16;
-                    PendListItem *np = realloc(pl, plcap * sizeof(*np));
+                    size_t nc, bytes;
+                    if (!next_cap(plcap, 16, &nc) || !mul_bytes(nc, sizeof(*pl), &bytes)) {
+                        ok = false; break;
+                    }
+                    PendListItem *np = realloc(pl, bytes);
                     if (!np) { ok = false; break; }
-                    pl = np;
+                    pl = np; plcap = nc;
                 }
                 /* store slot via current index j */
                 pl[plc].list = o;
@@ -1233,6 +1376,7 @@ Store *load(const char *path)
                 o->list.items[j] = (Object *)(uintptr_t)tid; /* temp, patch later */
                 plc++;
             }
+            if (!ok) free_object(o);   /* not yet store_push_obj'd */
             break;
         }
         case OBJ_VLIST: {
@@ -1257,8 +1401,8 @@ Store *load(const char *path)
         }
 
         if (!ok) break;
-        store_push_obj(s, o);
-        idmap_put(&map, id, o);
+        if (!store_push_obj(s, o)) { free_object(o); ok = false; break; }
+        if (!idmap_put(&map, id, o)) { ok = false; break; }
     }
 
     /* resolve field references by key */
@@ -1297,7 +1441,8 @@ Store *load(const char *path)
 
     /* roots */
     uint32_t nroots = 0;
-    if (ok && r_u32(f, &nroots)) {
+    if (ok && r_u32(f, &nroots) &&
+        count_fits_remaining(fsize, ftell(f), nroots, MIN_ROOT_BYTES)) {
         for (uint32_t i = 0; i < nroots && ok; i++) {
             char *name = r_str(f); uint32_t oid;
             if (!name || !r_u32(f, &oid)) { free(name); ok = false; break; }
@@ -1395,28 +1540,26 @@ static bool wal_apply_pending(Store *s, IdMap *map,
         switch (r->op) {
         case WOP_NEW_OBJECT: {
             Object *o = alloc_with_id(s, OBJ_COMPOSITE, r->target_id);
-            if (!o) return false;
-            idmap_put(map, r->target_id, o);
+            if (!o || !idmap_put(map, r->target_id, o)) return false;
             break;
         }
         case WOP_NEW_INT: {
             Object *o = alloc_with_id(s, OBJ_INT, r->target_id);
             if (!o) return false;
             o->int_value = r->new_int;
-            idmap_put(map, r->target_id, o);
+            if (!idmap_put(map, r->target_id, o)) return false;
             break;
         }
         case WOP_NEW_STRING: {
             Object *o = alloc_with_id(s, OBJ_STRING, r->target_id);
             if (!o) return false;
             o->str_value = r->new_str; r->new_str = NULL; /* move */
-            idmap_put(map, r->target_id, o);
+            if (!idmap_put(map, r->target_id, o)) return false;
             break;
         }
         case WOP_NEW_LIST: {
             Object *o = alloc_with_id(s, OBJ_LIST, r->target_id);
-            if (!o) return false;
-            idmap_put(map, r->target_id, o);
+            if (!o || !idmap_put(map, r->target_id, o)) return false;
             break;
         }
         case WOP_NEW_VLIST: {
@@ -1431,7 +1574,7 @@ static bool wal_apply_pending(Store *s, IdMap *map,
             o->vlist.type_name = r->new_str; r->new_str = NULL;  /* move */
             o->vlist.ops = ops;
             o->vlist.params = idmap_get(map, (uint32_t)r->old_int);
-            idmap_put(map, r->target_id, o);
+            if (!idmap_put(map, r->target_id, o)) return false;
             break;
         }
         case WOP_SET_INT: {
@@ -1622,6 +1765,11 @@ static bool wal_read_rec(FILE *f, TxnRec *r)
     return false;  /* unknown op */
 }
 
+/* Bound on records buffered for a single uncommitted txn during replay
+ * (mirrors the 1<<24 string-length cap in r_str: generous for legitimate
+ * use, finite against a crafted/corrupt WAL). */
+#define POG_MAX_TXN_RECS_REPLAY (1u << 24)
+
 /* Replay committed transactions from WAL; returns byte offset of end
  * of last complete COMMIT (so we can truncate any torn tail). */
 static bool wal_replay(Store *s, const char *wal_path, IdMap *map, long *good_end)
@@ -1678,9 +1826,19 @@ static bool wal_replay(Store *s, const char *wal_path, IdMap *map, long *good_en
             (void)pos;
         } else {
             if (!in_txn) { txnrec_free_owned(&rec); break; }
+            /* Cap a single in-flight (uncommitted) txn's buffered record
+             * count — an adversarial or corrupt WAL claiming one giant open
+             * txn that never commits would otherwise buffer unboundedly in
+             * RAM. Treated the same as a torn tail: stop and discard. */
+            if (pcount >= POG_MAX_TXN_RECS_REPLAY) {
+                txnrec_free_owned(&rec); break;
+            }
             if (pcount >= pcap) {
-                size_t nc = pcap ? pcap * 2 : 32;
-                TxnRec *a = realloc(pending, nc * sizeof(*a));
+                size_t nc, bytes;
+                if (!next_cap(pcap, 32, &nc) || !mul_bytes(nc, sizeof(*pending), &bytes)) {
+                    txnrec_free_owned(&rec); break;
+                }
+                TxnRec *a = realloc(pending, bytes);
                 if (!a) { txnrec_free_owned(&rec); break; }
                 pending = a; pcap = nc;
             }
@@ -1724,15 +1882,10 @@ static bool txn_commit_unlocked_impl(Store *s)
     if (s->wal_fp) ok = wal_write_txn(s, t);
 
     if (!ok) {
-        /* WAL failed: auto-abort so memory matches disk */
-        s->active_txn = NULL;   /* prevent re-entry */
-        for (ssize_t i = (ssize_t)t->count - 1; i >= 0; i--) {
-            /* not ideal — we can't easily run undo here without reworking abort;
-             * simplest: free log, reinstate txn, call abort */
-            (void)i;
-        }
-        s->active_txn = t;      /* restore for abort */
-        txn_abort(s);
+        /* WAL failed: auto-abort so memory matches disk. Must call the
+         * _unlocked variant — this function runs inside an already-locked
+         * public mutator/txn_commit and must never touch the store lock. */
+        txn_abort_unlocked_impl(s);
         return false;
     }
 
@@ -1981,11 +2134,12 @@ Store *store_open(const char *path)
     if (!wp) { store_destroy(s); return NULL; }
 
     IdMap map = {0};
-    for (size_t i = 0; i < s->count; i++)
-        idmap_put(&map, s->objects[i]->id, s->objects[i]);
+    bool seed_ok = true;
+    for (size_t i = 0; i < s->count && seed_ok; i++)
+        seed_ok = idmap_put(&map, s->objects[i]->id, s->objects[i]);
 
     long good_end = 0;
-    bool replay_ok = wal_replay(s, wp, &map, &good_end);
+    bool replay_ok = seed_ok && wal_replay(s, wp, &map, &good_end);
     free(map.items);
 
     if (!replay_ok) {

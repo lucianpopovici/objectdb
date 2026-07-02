@@ -24,6 +24,13 @@
 #define POG_MAX_ROOT_NAME  64
 #define POG_MAX_CLASS_NAME 64
 
+/* Root names are strncpy'd into TxnRec.key (object_graph.c), which is sized
+ * POG_MAX_KEY_LEN — these two constants are independent by name but must
+ * stay ordered or that strncpy overflows its destination. */
+_Static_assert(POG_MAX_ROOT_NAME <= POG_MAX_KEY_LEN,
+               "POG_MAX_ROOT_NAME must not exceed POG_MAX_KEY_LEN "
+               "(TxnRec.key is sized POG_MAX_KEY_LEN)");
+
 typedef enum {
     OBJ_COMPOSITE = 0,
     OBJ_INT       = 1,
