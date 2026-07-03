@@ -1930,6 +1930,299 @@ static void test_index_rehash_correctness(void)
     store_destroy(s);
 }
 
+/* ============================================================
+ * Ordered index (Tier 3a): canonical DNS-name order
+ * ============================================================ */
+
+static Object *mk_rr(Store *s, const char *name)
+{
+    Object *o = new_object(s);
+    set_class(o, "RR");
+    set_field(o, "name", new_string(s, name));
+    return o;
+}
+
+static void test_ord_index_canonical_ordering(void)
+{
+    SECTION("ord index: canonical DNS-name order (root < parent < child, alpha siblings)");
+    Store *s = store_create();
+    Object *root   = mk_rr(s, "");
+    Object *com    = mk_rr(s, "com");
+    Object *org    = mk_rr(s, "org");
+    Object *ex     = mk_rr(s, "example.com");
+    Object *a_ex   = mk_rr(s, "a.example.com");
+    Object *b_ex   = mk_rr(s, "b.example.com");
+
+    CHECK(ord_index_create(s, "RR", "name"));
+
+    CHECK(index_pred(s, "RR", "name", "") == NULL);
+    CHECK(index_succ(s, "RR", "name", "") == com);
+
+    CHECK(index_pred(s, "RR", "name", "com") == root);
+    CHECK(index_succ(s, "RR", "name", "com") == ex);
+
+    CHECK(index_pred(s, "RR", "name", "example.com") == com);
+    CHECK(index_succ(s, "RR", "name", "example.com") == a_ex);
+
+    CHECK(index_pred(s, "RR", "name", "a.example.com") == ex);
+    CHECK(index_succ(s, "RR", "name", "a.example.com") == b_ex);
+
+    CHECK(index_pred(s, "RR", "name", "b.example.com") == a_ex);
+    CHECK(index_succ(s, "RR", "name", "b.example.com") == org);
+
+    CHECK(index_pred(s, "RR", "name", "org") == b_ex);
+    CHECK(index_succ(s, "RR", "name", "org") == NULL);
+
+    /* succ/pred also work for a value that doesn't exist in the index. */
+    CHECK(index_succ(s, "RR", "name", "aa.example.com") == b_ex);
+    CHECK(index_pred(s, "RR", "name", "aa.example.com") == a_ex);
+    store_destroy(s);
+}
+
+static void test_ord_index_range(void)
+{
+    SECTION("ord index: inclusive range scan in canonical order");
+    Store *s = store_create();
+    mk_rr(s, "");
+    Object *com  = mk_rr(s, "com");
+    Object *ex   = mk_rr(s, "example.com");
+    Object *a_ex = mk_rr(s, "a.example.com");
+    Object *b_ex = mk_rr(s, "b.example.com");
+    mk_rr(s, "org");
+    CHECK(ord_index_create(s, "RR", "name"));
+
+    Object *found[8] = {0};
+    obj_collect oc = { found, 0, 8 };
+    size_t visited = index_range(s, "RR", "name", "com", "a.example.com", collect_cb, &oc);
+    CHECK(visited == 3);
+    CHECK(oc.count == 3);
+    CHECK(found[0] == com && found[1] == ex && found[2] == a_ex);
+
+    oc = (obj_collect){ found, 0, 8 };
+    visited = index_range(s, "RR", "name", "example.com", "example.com", collect_cb, &oc);
+    CHECK(visited == 1);
+    CHECK(found[0] == ex);
+
+    oc = (obj_collect){ found, 0, 8 };
+    visited = index_range(s, "RR", "name", "org", "com", collect_cb, &oc);
+    CHECK(visited == 0);
+
+    oc = (obj_collect){ found, 0, 8 };
+    visited = index_range(s, "RR", "name", "", "org", collect_cb, &oc);
+    CHECK(visited == 6);
+
+    (void)b_ex;
+    store_destroy(s);
+}
+
+static void test_ord_index_nonunique_values(void)
+{
+    SECTION("ord index: multiple objects sharing one value");
+    Store *s = store_create();
+    Object *a = mk_rr(s, "dup.example.com");
+    Object *b = mk_rr(s, "dup.example.com");
+    mk_rr(s, "aaa.example.com");
+    mk_rr(s, "zzz.example.com");
+    CHECK(ord_index_create(s, "RR", "name"));
+
+    Object *found[4] = {0};
+    obj_collect oc = { found, 0, 4 };
+    size_t visited = index_range(s, "RR", "name", "dup.example.com", "dup.example.com", collect_cb, &oc);
+    CHECK(visited == 2);
+    CHECK((found[0] == a && found[1] == b) || (found[0] == b && found[1] == a));
+
+    Object *r = index_succ(s, "RR", "name", "aaa.example.com");
+    CHECK(r == a || r == b);
+    store_destroy(s);
+}
+
+static void test_ord_index_set_field_maintenance(void)
+{
+    SECTION("ord index: maintained across set_field");
+    Store *s = store_create();
+    Object *a = mk_rr(s, "a.example.com");
+    Object *b = mk_rr(s, "b.example.com");
+    CHECK(ord_index_create(s, "RR", "name"));
+    CHECK(index_succ(s, "RR", "name", "a.example.com") == b);
+
+    set_field(a, "name", new_string(s, "z.example.com"));
+    CHECK(index_succ(s, "RR", "name", "b.example.com") == a);
+    CHECK(index_pred(s, "RR", "name", "z.example.com") == b);
+    store_destroy(s);
+}
+
+static void test_ord_index_set_class_maintenance(void)
+{
+    SECTION("ord index: maintained across set_class tag/retag/untag");
+    Store *s = store_create();
+    Object *a = new_object(s);
+    set_field(a, "name", new_string(s, "www.example.com"));
+    CHECK(ord_index_create(s, "RR", "name"));
+    CHECK(index_pred(s, "RR", "name", "z") == NULL);
+
+    set_class(a, "RR");
+    CHECK(index_pred(s, "RR", "name", "z") == a);
+
+    set_class(a, "Other");
+    CHECK(index_pred(s, "RR", "name", "z") == NULL);
+
+    set_class(a, "RR");
+    CHECK(index_pred(s, "RR", "name", "z") == a);
+
+    unset_class(a);
+    CHECK(index_pred(s, "RR", "name", "z") == NULL);
+    store_destroy(s);
+}
+
+static void test_ord_index_txn_commit(void)
+{
+    SECTION("ord index: maintained across explicit commit");
+    Store *s = store_create();
+    CHECK(ord_index_create(s, "RR", "name"));
+
+    CHECK(txn_begin(s));
+    Object *a = mk_rr(s, "x.example.com");
+    CHECK(index_pred(s, "RR", "name", "z") == a);
+    CHECK(txn_commit(s));
+    CHECK(index_pred(s, "RR", "name", "z") == a);
+    store_destroy(s);
+}
+
+static void test_ord_index_txn_abort(void)
+{
+    SECTION("ord index: maintained across explicit abort");
+    Store *s = store_create();
+    mk_rr(s, "before.example.com");
+    CHECK(ord_index_create(s, "RR", "name"));
+    CHECK(index_pred(s, "RR", "name", "z") != NULL);
+
+    CHECK(txn_begin(s));
+    mk_rr(s, "during.example.com");
+    CHECK(index_succ(s, "RR", "name", "before.example.com") != NULL);
+    CHECK(txn_abort(s));
+
+    CHECK(index_succ(s, "RR", "name", "before.example.com") == NULL);
+    CHECK(index_pred(s, "RR", "name", "z") != NULL);
+    store_destroy(s);
+}
+
+static void test_ord_index_gc(void)
+{
+    SECTION("ord index: maintained across GC");
+    Store *s = store_create();
+    Object *root = new_object(s);
+    bind(s, "R", root);
+    Object *live = new_object(s);
+    set_field(root, "live", live);
+    set_class(live, "RR");
+    set_field(live, "name", new_string(s, "aaa.example.com"));
+
+    /* orphan sorts strictly after live ("zzz" > "aaa"), so it's the
+     * canonical-order maximum until GC reclaims it -- exercising both
+     * removal from the ordered index and a change in what pred("z")
+     * (a sentinel greater than everything here) resolves to. */
+    Object *orphan = new_object(s);
+    set_class(orphan, "RR");
+    set_field(orphan, "name", new_string(s, "zzz.example.com"));
+
+    CHECK(ord_index_create(s, "RR", "name"));
+    CHECK(index_pred(s, "RR", "name", "z") == orphan);
+
+    gc(s);
+
+    CHECK(index_pred(s, "RR", "name", "z") == live);
+    store_destroy(s);
+}
+
+static void test_ord_index_create_idempotent(void)
+{
+    SECTION("ord index: create idempotency");
+    Store *s = store_create();
+    Object *a = mk_rr(s, "a.example.com");
+    CHECK(ord_index_create(s, "RR", "name"));
+    CHECK(ord_index_create(s, "RR", "name"));
+    CHECK(index_pred(s, "RR", "name", "z") == a);
+    store_destroy(s);
+}
+
+static void test_ord_index_drop(void)
+{
+    SECTION("ord index: drop stops maintenance/lookups");
+    Store *s = store_create();
+    mk_rr(s, "a.example.com");
+    CHECK(ord_index_create(s, "RR", "name"));
+    CHECK(ord_index_drop(s, "RR", "name"));
+    CHECK(!ord_index_drop(s, "RR", "name"));
+
+    CHECK(index_succ(s, "RR", "name", "") == NULL);
+    CHECK(index_pred(s, "RR", "name", "z") == NULL);
+    Object *found[4] = {0};
+    obj_collect oc = { found, 0, 4 };
+    size_t visited = index_range(s, "RR", "name", "", "z", collect_cb, &oc);
+    CHECK(visited == 0);
+    store_destroy(s);
+}
+
+static void test_ord_index_not_persisted(void)
+{
+    SECTION("ord index: declarations not persisted across store_open reopen");
+    const char *p = "/tmp/pog_ord_index_reopen.bin";
+    rm_both(p);
+
+    Store *s = store_open(p);
+    Object *a = mk_rr(s, "a.example.com");
+    bind(s, "A", a);
+    CHECK(ord_index_create(s, "RR", "name"));
+    CHECK(index_pred(s, "RR", "name", "z") == a);
+    store_close(s);
+
+    Store *s2 = store_open(p);
+    CHECK(index_pred(s2, "RR", "name", "z") == NULL);
+    Object *a2 = get(s2, "A");
+    CHECK(ord_index_create(s2, "RR", "name"));
+    CHECK(index_pred(s2, "RR", "name", "z") == a2);
+    store_close(s2);
+    rm_both(p);
+}
+
+static void test_ord_index_non_string_field_excluded(void)
+{
+    SECTION("ord index: non-string field values are silently excluded");
+    Store *s = store_create();
+    Object *a = new_object(s); set_class(a, "RR");
+    set_field(a, "ttl", new_int(s, 300));
+    Object *b = new_object(s); set_class(b, "RR");
+    set_field(b, "ttl", new_string(s, "300"));
+
+    CHECK(ord_index_create(s, "RR", "ttl"));
+    CHECK(index_pred(s, "RR", "ttl", "z") == b);
+    store_destroy(s);
+}
+
+static void test_ord_index_and_hash_index_coexist(void)
+{
+    SECTION("ord index: hash index and ordered index on the same (class, field) stay independently consistent");
+    Store *s = store_create();
+    Object *a = mk_rr(s, "a.example.com");
+    Object *b = mk_rr(s, "b.example.com");
+    CHECK(index_create(s, "RR", "name"));
+    CHECK(ord_index_create(s, "RR", "name"));
+
+    CHECK(index_lookup_one(s, "RR", "name", "a.example.com") == a);
+    CHECK(index_succ(s, "RR", "name", "a.example.com") == b);
+
+    set_field(a, "name", new_string(s, "z.example.com"));
+    CHECK(index_lookup_one(s, "RR", "name", "a.example.com") == NULL);
+    CHECK(index_lookup_one(s, "RR", "name", "z.example.com") == a);
+    CHECK(index_pred(s, "RR", "name", "z.example.com") == b);
+    CHECK(index_succ(s, "RR", "name", "b.example.com") == a);
+
+    set_class(a, "Other");
+    CHECK(index_lookup_one(s, "RR", "name", "z.example.com") == NULL);
+    CHECK(index_succ(s, "RR", "name", "b.example.com") == NULL);
+    store_destroy(s);
+}
+
 static void test_dns_ancestors_multilabel(void)
 {
     SECTION("vlist: dns.ancestors on a multi-label name");
@@ -2741,6 +3034,20 @@ int main(void)
     test_index_non_string_field_excluded();
     test_index_bytes_field_excluded();
     test_index_rehash_correctness();
+
+    test_ord_index_canonical_ordering();
+    test_ord_index_range();
+    test_ord_index_nonunique_values();
+    test_ord_index_set_field_maintenance();
+    test_ord_index_set_class_maintenance();
+    test_ord_index_txn_commit();
+    test_ord_index_txn_abort();
+    test_ord_index_gc();
+    test_ord_index_create_idempotent();
+    test_ord_index_drop();
+    test_ord_index_not_persisted();
+    test_ord_index_non_string_field_excluded();
+    test_ord_index_and_hash_index_coexist();
 
     test_dns_ancestors_multilabel();
     test_dns_ancestors_single_label();

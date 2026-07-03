@@ -127,6 +127,21 @@ typedef struct {
     size_t          total_entries;  /* distinct values across all buckets */
 } PogIndex;
 
+/* Ordered (canonical DNS-name order) index internals — Tier 3a. Use
+ * ord_index_create, ord_index_drop, index_succ, index_pred, index_range —
+ * not these fields directly. Reuses PogIndexEntry (value + owned Object*
+ * array) from the hash index above, but keeps a single flat array sorted
+ * by canonical DNS-name order instead of hash buckets, trading a hash
+ * index's O(1) point lookup for the ordered traversal (successor,
+ * predecessor, range) that DNSSEC NSEC chains and zone signing need. */
+typedef struct {
+    char          *cls;     /* owned; declared class name */
+    char          *field;   /* owned; declared field key */
+    PogIndexEntry *entries; /* owned array, ALWAYS sorted ascending by
+                              * canonical DNS-name order of ->value */
+    size_t         count, cap;
+} PogOrdIndex;
+
 struct Store {
     /* object table */
     Object   **objects;
@@ -175,6 +190,14 @@ struct Store {
     PogIndex *indexes;
     size_t    index_count;
     size_t    index_capacity;
+
+    /* ordered (canonical DNS-name order) indexes: declared (class, field)
+     * -> a single array of value -> [Object*] entries kept sorted. Tier 3a.
+     * Same derived-state rules as the hash indexes above: NOT persisted,
+     * NOT WAL-logged, rebuilt after abort/GC/load, maintained incrementally. */
+    PogOrdIndex *ord_indexes;
+    size_t       ord_index_count;
+    size_t       ord_index_capacity;
 
     /* store-wide rwlock.
      * Rules:
@@ -363,6 +386,70 @@ size_t  index_lookup(Store *s, const char *cls, const char *field,
  * declared index; does not fall back to scanning. */
 Object *index_lookup_one(Store *s, const char *cls, const char *field,
                          const char *value);
+
+/* ============================================================
+ * Ordered index: canonical DNS-name order (Tier 3a)
+ *
+ * A second kind of index over a (class, field) pair, declared and
+ * maintained independently of the hash index above. Where the hash index
+ * gives O(1) point lookup, this gives ordered traversal: "next existent
+ * name after X" (index_succ), "previous" (index_pred), and a canonical-
+ * order range scan (index_range) — what DNSSEC NSEC chains and
+ * canonical-order zone signing need. A (class, field) pair may have a
+ * hash index, an ordered index, both, or neither declared independently.
+ *
+ * Only OBJ_STRING field values participate, interpreted as dot-separated,
+ * presentation-format DNS names (case as given — no folding here, see
+ * CLAUDE-index.md tier 2b for why case-folding belongs in the DNS layer,
+ * not this engine). Ordering follows RFC 4034 section 6.1's canonical
+ * name comparison (label sequences compared most-significant/rightmost
+ * label first; a name that is a proper suffix of another sorts first;
+ * the root/empty name "" sorts before everything) but WITHOUT its
+ * case-folding step, for the same reason.
+ *
+ * Fully derived from object state (like the hash index) — NOT persisted,
+ * NOT WAL-logged. Declarations do not survive store_open()/load(); a
+ * fresh process must re-declare via ord_index_create() (idempotent,
+ * rebuilds from current state).
+ * ============================================================ */
+
+/* Declare an ordered index on (class, field). Idempotent — a second call
+ * with the same pair is a no-op returning true. Builds the index over all
+ * current instances of `class` immediately. Maintained incrementally by
+ * set_field/set_class thereafter, rebuilt wholesale after abort/GC.
+ * Returns false on invalid input (same validation as index_create) or
+ * allocation failure (nothing declared in that case). */
+bool    ord_index_create(Store *s, const char *cls, const char *field);
+
+/* Drop a previously-declared ordered index. Returns false if none was
+ * declared for this pair. */
+bool    ord_index_drop(Store *s, const char *cls, const char *field);
+
+/* The next existent name strictly after `value` in canonical order, or
+ * NULL if `value` is the greatest (no wraparound — this is a plain
+ * ordered index, not a signed zone's closed NSEC ring). `value` itself
+ * need not exist in the index. Requires a declared ordered index for
+ * (cls, field); returns NULL if none exists. If several objects share the
+ * successor's value, returns one of them (like index_lookup_one). */
+Object *index_succ(Store *s, const char *cls, const char *field,
+                   const char *value);
+
+/* The previous existent name strictly before `value` in canonical order,
+ * or NULL if `value` is the least (or the index is empty). Same
+ * requirements and non-uniqueness handling as index_succ. */
+Object *index_pred(Store *s, const char *cls, const char *field,
+                   const char *value);
+
+/* Invoke cb for every object whose indexed field value falls in [lo, hi]
+ * inclusive, in ascending canonical order, grouping all objects at each
+ * distinct value together (non-unique values all visited). Requires a
+ * declared ordered index for (cls, field) — returns 0 without scanning if
+ * none exists. Snapshot semantics identical to index_lookup: the bucket
+ * range is copied under the read lock, then cb is invoked lock-free.
+ * Returns the number of objects visited; false from cb stops early. */
+size_t  index_range(Store *s, const char *cls, const char *field,
+                    const char *lo, const char *hi,
+                    query_fn cb, void *ud);
 
 /* ============================================================
  * Version change log (IXFR-style diffing)

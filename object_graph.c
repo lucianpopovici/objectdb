@@ -786,6 +786,261 @@ static bool index_drop_unlocked(Store *s, const char *cls, const char *field)
 }
 
 /* ============================================================
+ * Ordered index: canonical DNS-name order (Tier 3a)
+ *
+ * Declared (class, field) -> a single flat array of PogIndexEntry (the
+ * same value+Object* shape the hash index's buckets use), kept sorted
+ * ascending by pog_dns_name_cmp. Gives index_succ/index_pred (next/
+ * previous existent name) and index_range (canonical-order range scan) —
+ * the traversal primitives DNSSEC NSEC chains and zone signing need,
+ * which the O(1) point-lookup hash index above cannot provide.
+ *
+ * Binary search gives O(log n) lookup; insert/remove are O(n) (a memmove
+ * to keep the array sorted), trading a balanced tree's O(log n) both ways
+ * for a much smaller, more auditable implementation — consistent with
+ * this file's existing precedent of dynamic arrays over pointer-linked
+ * structures everywhere (class index, hash index buckets). Authoritative
+ * zones are edited occasionally and served constantly (see
+ * CLAUDE-index.md's scope boundary), so O(n) insert is an acceptable
+ * trade here.
+ *
+ * Same derived-state rules as the hash index: never WAL-logged, rebuilt
+ * wholesale after abort/GC/load (ord_index_rebuild_all, called at every
+ * index_rebuild_all call site), maintained incrementally inline by
+ * set_field_unlocked/set_class_unlocked_impl, declarations not persisted.
+ * ============================================================ */
+
+#define POG_DNS_MAX_LABELS 128
+
+/* Split `name` into label spans (pointer+len into the original string, no
+ * allocation), left to right. Returns the label count; 0 for the root/
+ * empty name. Silently stops after POG_DNS_MAX_LABELS labels — real DNS
+ * names cannot exceed 127, so this never triggers on legitimate input. */
+static size_t pog_dns_split_labels(const char *name, const char **starts, size_t *lens)
+{
+    size_t n = 0;
+    if (!name || !*name) return 0;
+    const char *p = name;
+    while (*p && n < POG_DNS_MAX_LABELS) {
+        const char *start = p;
+        while (*p && *p != '.') p++;
+        starts[n] = start; lens[n] = (size_t)(p - start);
+        n++;
+        if (*p == '.') p++;
+        else break;
+    }
+    return n;
+}
+
+/* Canonical DNS name comparator (RFC 4034 section 6.1), minus its
+ * case-folding step — this engine keeps case handling in the DNS layer
+ * per CLAUDE-index.md tier 2b; the ordered index is byte-exact like the
+ * hash index. Compares label sequences most-significant (rightmost) label
+ * first; a name that is a proper suffix of another (fewer labels, all
+ * matching from the right) sorts first. The root ("") sorts before
+ * everything, since it has zero labels. */
+static int pog_dns_name_cmp(const char *a, const char *b)
+{
+    const char *as[POG_DNS_MAX_LABELS], *bs[POG_DNS_MAX_LABELS];
+    size_t alen[POG_DNS_MAX_LABELS], blen[POG_DNS_MAX_LABELS];
+    size_t an = pog_dns_split_labels(a, as, alen);
+    size_t bn = pog_dns_split_labels(b, bs, blen);
+
+    size_t i = an, j = bn;
+    while (i > 0 && j > 0) {
+        i--; j--;
+        size_t ml = alen[i] < blen[j] ? alen[i] : blen[j];
+        int c = memcmp(as[i], bs[j], ml);
+        if (c != 0) return c;
+        if (alen[i] != blen[j]) return alen[i] < blen[j] ? -1 : 1;
+    }
+    if (an != bn) return an < bn ? -1 : 1;
+    return 0;
+}
+
+static bool ord_index_ensure_cap(Store *s)
+{
+    if (s->ord_index_count < s->ord_index_capacity) return true;
+    size_t nc, bytes;
+    if (!next_cap(s->ord_index_capacity, 4, &nc) ||
+        !mul_bytes(nc, sizeof(*s->ord_indexes), &bytes))
+        return false;
+    PogOrdIndex *a = realloc(s->ord_indexes, bytes);
+    if (!a) return false;
+    s->ord_indexes = a;
+    for (size_t i = s->ord_index_capacity; i < nc; i++)
+        s->ord_indexes[i] = (PogOrdIndex){0};
+    s->ord_index_capacity = nc;
+    return true;
+}
+
+static size_t ord_index_find_idx_unlocked(Store *s, const char *cls, const char *field)
+{
+    if (!s || !cls || !field) return SIZE_MAX;
+    for (size_t i = 0; i < s->ord_index_count; i++)
+        if (strcmp(s->ord_indexes[i].cls, cls) == 0 &&
+            strcmp(s->ord_indexes[i].field, field) == 0)
+            return i;
+    return SIZE_MAX;
+}
+
+static bool ord_entries_ensure_cap(PogOrdIndex *idx)
+{
+    if (idx->count < idx->cap) return true;
+    size_t nc, bytes;
+    if (!next_cap(idx->cap, 8, &nc) || !mul_bytes(nc, sizeof(*idx->entries), &bytes))
+        return false;
+    PogIndexEntry *a = realloc(idx->entries, bytes);
+    if (!a) return false;
+    idx->entries = a; idx->cap = nc;
+    return true;
+}
+
+/* Binary search idx->entries (sorted by pog_dns_name_cmp) for `value`. On
+ * exact match, *pos is its index and this returns true. On miss, *pos is
+ * the insertion point (index of the first entry > value, == idx->count if
+ * value is greater than everything) and this returns false. */
+static bool ord_index_bsearch(PogOrdIndex *idx, const char *value, size_t *pos)
+{
+    size_t lo = 0, hi = idx->count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int c = pog_dns_name_cmp(idx->entries[mid].value, value);
+        if (c == 0) { *pos = mid; return true; }
+        if (c < 0) lo = mid + 1; else hi = mid;
+    }
+    *pos = lo;
+    return false;
+}
+
+static bool ord_index_insert_unlocked(PogOrdIndex *idx, const char *value, Object *o)
+{
+    size_t pos;
+    if (ord_index_bsearch(idx, value, &pos))
+        return index_entry_append_item(&idx->entries[pos], o);
+
+    if (!ord_entries_ensure_cap(idx)) return false;
+
+    /* Build the new entry fully in a local before touching the live array
+     * — a failure here leaves idx completely unchanged. */
+    PogIndexEntry ne = {0};
+    ne.value = strdup(value);
+    if (!ne.value) return false;
+    if (!index_entry_append_item(&ne, o)) { free(ne.value); return false; }
+
+    memmove(&idx->entries[pos + 1], &idx->entries[pos],
+            (idx->count - pos) * sizeof(*idx->entries));
+    idx->entries[pos] = ne;
+    idx->count++;
+    return true;
+}
+
+static void ord_index_remove_unlocked(PogOrdIndex *idx, const char *value, Object *o)
+{
+    size_t pos;
+    if (!ord_index_bsearch(idx, value, &pos)) return;
+    PogIndexEntry *e = &idx->entries[pos];
+    index_entry_remove_item(e, o);
+    if (e->count == 0) {
+        free(e->value); free(e->items);
+        memmove(&idx->entries[pos], &idx->entries[pos + 1],
+                (idx->count - pos - 1) * sizeof(*idx->entries));
+        idx->count--;
+    }
+}
+
+static void ord_index_free_contents(PogOrdIndex *idx)
+{
+    for (size_t i = 0; i < idx->count; i++) {
+        free(idx->entries[i].value);
+        free(idx->entries[i].items);
+    }
+    free(idx->entries);
+    idx->entries = NULL; idx->count = 0; idx->cap = 0;
+}
+
+static void ord_index_free_all(PogOrdIndex *idx)
+{
+    ord_index_free_contents(idx);
+    free(idx->cls); free(idx->field);
+    idx->cls = idx->field = NULL;
+}
+
+/* Rebuild one ordered index's CONTENTS from current live state (keeps the
+ * declaration intact). Mirrors index_rebuild_one_unlocked exactly, just
+ * inserting into the sorted array instead of a hash table. */
+static bool ord_index_rebuild_one_unlocked(Store *s, PogOrdIndex *idx)
+{
+    ord_index_free_contents(idx);
+    size_t ci = class_find_idx(s, idx->cls);
+    if (ci == SIZE_MAX) return true;   /* class has no instances (yet) */
+    size_t n = s->class_counts[ci];
+    for (size_t i = 0; i < n; i++) {
+        Object *o = s->class_instances[ci][i];
+        Field *f = find_field(o, idx->field);
+        if (f && f->value && f->value->kind == OBJ_STRING) {
+            if (!ord_index_insert_unlocked(idx, f->value->str_value, o))
+                return false;
+        }
+    }
+    return true;
+}
+
+/* Rebuild ALL declared ordered indexes' contents from current live state.
+ * Call alongside every index_rebuild_all(s) call site. */
+static void ord_index_rebuild_all(Store *s)
+{
+    for (size_t i = 0; i < s->ord_index_count; i++)
+        (void)ord_index_rebuild_one_unlocked(s, &s->ord_indexes[i]);
+}
+
+/* Remove o from every ordered index declared on cls_name, among
+ * s->ord_indexes[0..upto). Mirrors index_unwind_class_inserts exactly. */
+static void ord_index_unwind_class_inserts(Store *s, size_t upto, const char *cls_name, Object *o)
+{
+    for (size_t i = 0; i < upto; i++) {
+        PogOrdIndex *idx = &s->ord_indexes[i];
+        if (strcmp(idx->cls, cls_name) != 0) continue;
+        Field *f = find_field(o, idx->field);
+        if (!f || !f->value || f->value->kind != OBJ_STRING) continue;
+        ord_index_remove_unlocked(idx, f->value->str_value, o);
+    }
+}
+
+static bool ord_index_create_unlocked(Store *s, const char *cls, const char *field)
+{
+    if (!s || !cls || !*cls || !field || !*field) return false;
+    if (strlen(field) >= POG_MAX_KEY_LEN) return false;
+    if (strlen(cls) >= POG_MAX_CLASS_NAME) return false;
+
+    if (ord_index_find_idx_unlocked(s, cls, field) != SIZE_MAX) return true;  /* idempotent */
+
+    if (!ord_index_ensure_cap(s)) return false;
+    char *cls_dup = strdup(cls);
+    char *field_dup = cls_dup ? strdup(field) : NULL;
+    if (!cls_dup || !field_dup) { free(cls_dup); free(field_dup); return false; }
+
+    size_t i = s->ord_index_count++;
+    s->ord_indexes[i] = (PogOrdIndex){ .cls = cls_dup, .field = field_dup };
+
+    if (!ord_index_rebuild_one_unlocked(s, &s->ord_indexes[i])) {
+        ord_index_free_all(&s->ord_indexes[i]);
+        s->ord_index_count--;
+        return false;
+    }
+    return true;
+}
+
+static bool ord_index_drop_unlocked(Store *s, const char *cls, const char *field)
+{
+    size_t i = ord_index_find_idx_unlocked(s, cls, field);
+    if (i == SIZE_MAX) return false;
+    ord_index_free_all(&s->ord_indexes[i]);
+    s->ord_indexes[i] = s->ord_indexes[--s->ord_index_count];   /* swap-and-pop */
+    return true;
+}
+
+/* ============================================================
  * Locking helpers
  *
  * Convention:
@@ -911,6 +1166,11 @@ void store_destroy(Store *s)
     for (size_t i = 0; i < s->index_count; i++)
         index_free_all(&s->indexes[i]);
     free(s->indexes);
+
+    /* ordered indexes (Tier 3a) */
+    for (size_t i = 0; i < s->ord_index_count; i++)
+        ord_index_free_all(&s->ord_indexes[i]);
+    free(s->ord_indexes);
 
     pthread_rwlock_destroy(&s->lock);
     free(s);
@@ -1149,9 +1409,12 @@ static bool set_field_unlocked(Object *o, const char *key, Object *value)
      * to its current string content, which would otherwise insert a
      * duplicate Object* into an entry it's already a member of. */
     PogIndex *idx = NULL;
+    PogOrdIndex *oidx = NULL;
     if (o->class_name) {
         size_t ii = index_find_idx_unlocked(s, o->class_name, key);
         if (ii != SIZE_MAX) idx = &s->indexes[ii];
+        size_t oi = ord_index_find_idx_unlocked(s, o->class_name, key);
+        if (oi != SIZE_MAX) oidx = &s->ord_indexes[oi];
     }
     const char *old_str = (ex && ex->value && ex->value->kind == OBJ_STRING)
                            ? ex->value->str_value : NULL;
@@ -1161,6 +1424,13 @@ static bool set_field_unlocked(Object *o, const char *key, Object *value)
 
     if (idx && new_str && !same_value) {
         if (!index_insert_unlocked(idx, new_str, o)) {
+            auto_end(s, started, false);
+            return false;
+        }
+    }
+    if (oidx && new_str && !same_value) {
+        if (!ord_index_insert_unlocked(oidx, new_str, o)) {
+            if (idx) index_remove_unlocked(idx, new_str, o);   /* unwind the hash-index insert above */
             auto_end(s, started, false);
             return false;
         }
@@ -1177,6 +1447,7 @@ static bool set_field_unlocked(Object *o, const char *key, Object *value)
     } else {
         if (!composite_grow(o)) {
             if (idx && new_str && !same_value) index_remove_unlocked(idx, new_str, o);
+            if (oidx && new_str && !same_value) ord_index_remove_unlocked(oidx, new_str, o);
             auto_end(s, started, false);
             return false;
         }
@@ -1188,6 +1459,8 @@ static bool set_field_unlocked(Object *o, const char *key, Object *value)
 
     if (idx && old_str && !same_value)
         index_remove_unlocked(idx, old_str, o);
+    if (oidx && old_str && !same_value)
+        ord_index_remove_unlocked(oidx, old_str, o);
 
     log_push(s, r);
     return auto_end(s, started, true);
@@ -1573,6 +1846,7 @@ static void gc_unlocked(Store *s)
     /* GC may have freed tagged objects; rebuild the class index. */
     class_index_rebuild(s);
     index_rebuild_all(s);
+    ord_index_rebuild_all(s);
 }
 
 void gc(Store *s)
@@ -1964,6 +2238,7 @@ Store *load(const char *path)
     s->seq = seq;
     class_index_rebuild(s);
     index_rebuild_all(s);
+    ord_index_rebuild_all(s);
     return s;
 }
 
@@ -2791,6 +3066,7 @@ static bool txn_abort_unlocked_impl(Store *s)
      * Rebuild the index from surviving object state. */
     class_index_rebuild(s);
     index_rebuild_all(s);
+    ord_index_rebuild_all(s);
 
     /* Roots added after begin should be dropped (unused marker) — but our
      * undo already marks them unused. Also shrink root_count to drop any
@@ -2904,6 +3180,7 @@ Store *store_open(const char *path)
     /* WAL replay may have created newly-tagged composites; rebuild index. */
     class_index_rebuild(s);
     index_rebuild_all(s);
+    ord_index_rebuild_all(s);
 
     /* 3) Truncate any torn tail from WAL so new writes append cleanly. */
     if (stat(wp, &st) == 0 && good_end > 0 && good_end < st.st_size) {
@@ -3602,12 +3879,34 @@ static bool set_class_unlocked_impl(Object *o, const char *new_name)
             auto_end(s, started, false);
             return false;
         }
+
+        /* Same speculative-insert pass for the ordered index, run only
+         * after the hash-index loop above fully succeeded. A mid-loop
+         * failure here must unwind its own bounded partial insert AND the
+         * hash-index loop's full set of inserts (which already succeeded). */
+        size_t ord_failed_at = SIZE_MAX;
+        for (size_t i = 0; i < s->ord_index_count; i++) {
+            PogOrdIndex *oidx = &s->ord_indexes[i];
+            if (strcmp(oidx->cls, new_name) != 0) continue;
+            Field *f = find_field(o, oidx->field);
+            if (!f || !f->value || f->value->kind != OBJ_STRING) continue;
+            if (!ord_index_insert_unlocked(oidx, f->value->str_value, o)) { ord_failed_at = i; break; }
+        }
+        if (ord_failed_at != SIZE_MAX) {
+            ord_index_unwind_class_inserts(s, ord_failed_at, new_name, o);
+            index_unwind_class_inserts(s, s->index_count, new_name, o);
+            auto_end(s, started, false);
+            return false;
+        }
     }
 
     /* Save old value for undo. */
     char *saved_old = old_name ? strdup(old_name) : NULL;
     if (old_name && !saved_old) {
-        if (want_tag) index_unwind_class_inserts(s, s->index_count, new_name, o);
+        if (want_tag) {
+            index_unwind_class_inserts(s, s->index_count, new_name, o);
+            ord_index_unwind_class_inserts(s, s->ord_index_count, new_name, o);
+        }
         auto_end(s, started, false);
         return false;
     }
@@ -3630,6 +3929,7 @@ static bool set_class_unlocked_impl(Object *o, const char *new_name)
                 if (oi != SIZE_MAX) class_list_append(s, oi, o);
             }
             index_unwind_class_inserts(s, s->index_count, new_name, o);
+            ord_index_unwind_class_inserts(s, s->ord_index_count, new_name, o);
             free(saved_old);
             auto_end(s, started, false);
             return false;
@@ -3650,6 +3950,7 @@ static bool set_class_unlocked_impl(Object *o, const char *new_name)
                 if (oi != SIZE_MAX) class_list_append(s, oi, o);
             }
             index_unwind_class_inserts(s, s->index_count, new_name, o);
+            ord_index_unwind_class_inserts(s, s->ord_index_count, new_name, o);
             auto_end(s, started, false);
             return false;
         }
@@ -3661,8 +3962,10 @@ static bool set_class_unlocked_impl(Object *o, const char *new_name)
      * cannot fail (swap-and-pop only). Uses saved_old, not old_name: the
      * latter was a borrowed pointer into o->class_name, which was just
      * free()'d and reassigned above — old_name is dangling here. */
-    if (saved_old)
+    if (saved_old) {
         index_unwind_class_inserts(s, s->index_count, saved_old, o);
+        ord_index_unwind_class_inserts(s, s->ord_index_count, saved_old, o);
+    }
 
     /* WAL record */
     TxnRec r = {0};
@@ -3970,6 +4273,92 @@ bool index_create(Store *s, const char *cls, const char *field) {
 }
 bool index_drop(Store *s, const char *cls, const char *field) {
     LOCK_W(s); bool r = index_drop_unlocked(s, cls, field); UNLOCK_W(s); return r;
+}
+
+/* ---- ordered index (Tier 3a): public wrappers ---- */
+
+bool ord_index_create(Store *s, const char *cls, const char *field) {
+    LOCK_W(s); bool r = ord_index_create_unlocked(s, cls, field); UNLOCK_W(s); return r;
+}
+bool ord_index_drop(Store *s, const char *cls, const char *field) {
+    LOCK_W(s); bool r = ord_index_drop_unlocked(s, cls, field); UNLOCK_W(s); return r;
+}
+
+Object *index_succ(Store *s, const char *cls, const char *field, const char *value)
+{
+    if (!s || !cls || !field || !value) return NULL;
+    LOCK_R(s);
+    size_t ii = ord_index_find_idx_unlocked(s, cls, field);
+    if (ii == SIZE_MAX) { UNLOCK_R(s); return NULL; }
+    PogOrdIndex *idx = &s->ord_indexes[ii];
+    size_t pos;
+    bool exact = ord_index_bsearch(idx, value, &pos);
+    size_t next = exact ? pos + 1 : pos;
+    Object *r = (next < idx->count && idx->entries[next].count > 0)
+                ? idx->entries[next].items[0] : NULL;
+    UNLOCK_R(s);
+    return r;
+}
+
+Object *index_pred(Store *s, const char *cls, const char *field, const char *value)
+{
+    if (!s || !cls || !field || !value) return NULL;
+    LOCK_R(s);
+    size_t ii = ord_index_find_idx_unlocked(s, cls, field);
+    if (ii == SIZE_MAX) { UNLOCK_R(s); return NULL; }
+    PogOrdIndex *idx = &s->ord_indexes[ii];
+    size_t pos;
+    /* Whether or not `value` exists exactly, the insertion-point/match
+     * index `pos` is the first entry >= value, so pos-1 is always the
+     * predecessor. */
+    ord_index_bsearch(idx, value, &pos);
+    Object *r = (pos > 0 && idx->entries[pos - 1].count > 0)
+                ? idx->entries[pos - 1].items[0] : NULL;
+    UNLOCK_R(s);
+    return r;
+}
+
+size_t index_range(Store *s, const char *cls, const char *field,
+                   const char *lo, const char *hi, query_fn cb, void *ud)
+{
+    if (!s || !cls || !field || !lo || !hi || !cb) return 0;
+    LOCK_R(s);
+    size_t ii = ord_index_find_idx_unlocked(s, cls, field);
+    if (ii == SIZE_MAX) { UNLOCK_R(s); return 0; }
+    PogOrdIndex *idx = &s->ord_indexes[ii];
+
+    size_t start;
+    ord_index_bsearch(idx, lo, &start);      /* first entry >= lo, exact or not */
+    size_t end;
+    if (ord_index_bsearch(idx, hi, &end)) end++;   /* include an exact match on hi */
+
+    if (start >= end) { UNLOCK_R(s); return 0; }
+
+    /* Snapshot every object pointer in [start, end) before releasing the
+     * lock -- same discipline as index_lookup/query_class: callbacks run
+     * lock-free and may safely re-enter the store. */
+    size_t total = 0;
+    for (size_t i = start; i < end; i++) total += idx->entries[i].count;
+    Object **snap = NULL;
+    if (total > 0) {
+        snap = malloc(total * sizeof(*snap));
+        if (!snap) { UNLOCK_R(s); return 0; }
+        size_t w = 0;
+        for (size_t i = start; i < end; i++) {
+            PogIndexEntry *e = &idx->entries[i];
+            memcpy(&snap[w], e->items, e->count * sizeof(*snap));
+            w += e->count;
+        }
+    }
+    UNLOCK_R(s);
+
+    size_t visited = 0;
+    for (size_t i = 0; i < total; i++) {
+        visited++;
+        if (!cb(snap[i], ud)) break;
+    }
+    free(snap);
+    return visited;
 }
 
 uint32_t store_version(Store *s)
