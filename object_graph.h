@@ -96,6 +96,32 @@ typedef struct {
     bool    used;
 } Root;
 
+/* Secondary hash index internals — exposed like the rest of Store's
+ * internals (this engine has no opaque types). Use index_create,
+ * index_lookup, index_lookup_one, index_drop — not these fields directly.
+ *
+ * PogIndexBucket is a chaining hash bucket implemented as a growable
+ * array of entries — not a linked list (this file has none; everything
+ * is a dynamic array grown via next_cap/mul_bytes). */
+typedef struct {
+    char    *value;    /* owned; the distinct field value this entry represents */
+    Object **items;    /* owned array; objects whose field == value */
+    size_t   count, cap;
+} PogIndexEntry;
+
+typedef struct {
+    PogIndexEntry *entries;   /* owned array, growable */
+    size_t         count, cap;
+} PogIndexBucket;
+
+typedef struct {
+    char           *cls;            /* owned; declared class name */
+    char           *field;          /* owned; declared field key */
+    PogIndexBucket *buckets;        /* owned array, size == bucket_count */
+    size_t          bucket_count;   /* ALWAYS a power of two; 0 until first insert */
+    size_t          total_entries;  /* distinct values across all buckets */
+} PogIndex;
+
 struct Store {
     /* object table */
     Object   **objects;
@@ -126,6 +152,14 @@ struct Store {
     size_t   *class_caps;
     size_t    class_count;
     size_t    class_capacity;
+
+    /* secondary hash indexes: declared (class, field) -> value -> [Object*].
+     * Derived state like the class index above — NOT persisted, NOT
+     * WAL-logged. index_create()/index_drop() are process-lifetime
+     * declarations only; re-declare on every store_open(). */
+    PogIndex *indexes;
+    size_t    index_count;
+    size_t    index_capacity;
 
     /* store-wide rwlock.
      * Rules:
@@ -188,6 +222,15 @@ Object *pog_vlist_emit_string(Object *view, const char *v);
 extern const VListOps pog_cidr_all;     /* type_name = "cidr.all"     */
 extern const VListOps pog_cidr_free;    /* type_name = "cidr.free"    */
 extern const VListOps pog_cidr_subnets; /* type_name = "cidr.subnets" */
+/* params: composite with string field "name" — a dot-separated,
+ * presentation-format DNS name (case as given; no case-folding here).
+ * dns.ancestors yields the name and each shorter suffix up to and
+ * including the empty root (""); len() == label_count(name) + 1.
+ * dns.wildcards yields "*."+suffix for the same suffixes, skipping the
+ * first label and stopping one short of root (no "*." variant of the
+ * root); len() == max(label_count(name) - 1, 0). */
+extern const VListOps pog_dns_ancestors; /* type_name = "dns.ancestors" */
+extern const VListOps pog_dns_wildcards; /* type_name = "dns.wildcards" */
 void pog_register_builtins(void);
 
 /* --- Named roots --- */
@@ -245,12 +288,55 @@ size_t  query_class(Store *s, const char *class_name,
                     query_fn fn, void *userdata);
 
 /* Convenience: find the first instance of `class_name` whose string-valued
- * field `key` equals `value`. O(n) over the class's instances. Returns
- * NULL if no match. */
+ * field `key` equals `value`. O(1) if an index is declared on
+ * (class_name, key) via index_create(), else O(n) linear scan over the
+ * class's instances. Returns NULL if no match. */
 Object *find_by_field(Store *s, const char *class_name,
                       const char *key, const char *value);
 
 /* How many instances in a class (0 if class doesn't exist). */
 size_t  class_size(Store *s, const char *class_name);
+
+/* ============================================================
+ * Secondary hash index: name -> [objects]
+ *
+ * Declare an index on a (class, field) pair to make find_by_field (and
+ * index_lookup*) O(1) average case instead of O(n). Only OBJ_STRING field
+ * values participate — non-string or missing fields are simply not
+ * indexed, mirroring find_by_field's existing restriction.
+ *
+ * Fully derived from object state (like the class index) — NOT persisted,
+ * NOT WAL-logged. index_create/index_drop are not part of the transaction
+ * log: a txn_abort does not "undo" an index_create/index_drop as an
+ * operation, it only restores object/field/class state, after which the
+ * index is rebuilt from that restored state. After load()/store_open() a
+ * fresh process must re-declare every index it needs — idempotent, cheap.
+ * ============================================================ */
+
+/* Declare an index on (class, field). Idempotent — a second call with the
+ * same pair is a no-op returning true. Builds the index over all current
+ * instances of `class` immediately (O(class size)). Maintained
+ * incrementally by set_field/set_class thereafter, rebuilt wholesale
+ * after abort/GC. Returns false on invalid input (NULL/empty, or a name
+ * exceeding POG_MAX_KEY_LEN/POG_MAX_CLASS_NAME — rejected, not truncated)
+ * or on allocation failure (nothing declared in that case). */
+bool    index_create(Store *s, const char *cls, const char *field);
+
+/* Drop a previously-declared index. Returns false if none was declared.
+ * find_by_field falls back to its O(n) scan for this pair afterward. */
+bool    index_drop(Store *s, const char *cls, const char *field);
+
+/* O(1) average-case lookup: invoke cb for every instance of `cls` whose
+ * `field` string value equals `value`. Requires a declared index for
+ * (cls, field) — returns 0 without scanning if none exists (use
+ * find_by_field for scan-with-fallback). Snapshot semantics identical to
+ * query_class. Returns the number of objects visited. */
+size_t  index_lookup(Store *s, const char *cls, const char *field,
+                     const char *value, query_fn cb, void *ud);
+
+/* Convenience: first match from index_lookup, or NULL. Requires a
+ * declared index; does not fall back to scanning. */
+Object *index_lookup_one(Store *s, const char *cls, const char *field,
+                         const char *value);
 
 #endif /* OBJECT_GRAPH_H */

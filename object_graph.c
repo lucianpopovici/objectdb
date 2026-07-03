@@ -442,6 +442,337 @@ static Root *find_root(Store *s, const char *name)
 }
 
 /* ============================================================
+ * Secondary hash index: declared (class, field) -> value -> [Object*]
+ *
+ * Derived state, modeled directly on the class index above: never
+ * WAL-logged, rebuilt wholesale after abort/GC (index_rebuild_all, called
+ * right after every class_index_rebuild call site) and maintained
+ * incrementally inline by set_field_unlocked/set_class_unlocked_impl.
+ * Index *declarations* (which (class, field) pairs exist) are NOT
+ * persisted — the application re-declares via index_create() after
+ * store_open()/load(); that call does its own initial full build.
+ *
+ * Each PogIndex is a chaining hash table keyed by field value: buckets[]
+ * is sized bucket_count (always a power of two), each bucket holds a
+ * growable array of PogIndexEntry (one per distinct value hashing there),
+ * each entry holds a growable array of the objects currently at that
+ * value. No linked lists anywhere — everything grows via the existing
+ * next_cap/mul_bytes overflow-checked doubling helpers.
+ * ============================================================ */
+
+static uint64_t pog_fnv1a(const char *s)
+{
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        h ^= (uint64_t)*p;
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static bool index_ensure_cap(Store *s)
+{
+    if (s->index_count < s->index_capacity) return true;
+    size_t nc, bytes;
+    if (!next_cap(s->index_capacity, 4, &nc) ||
+        !mul_bytes(nc, sizeof(*s->indexes), &bytes))
+        return false;
+    PogIndex *a = realloc(s->indexes, bytes);
+    if (!a) return false;
+    s->indexes = a;
+    for (size_t i = s->index_capacity; i < nc; i++)
+        s->indexes[i] = (PogIndex){0};
+    s->index_capacity = nc;
+    return true;
+}
+
+static size_t index_find_idx_unlocked(Store *s, const char *cls, const char *field)
+{
+    if (!s || !cls || !field) return SIZE_MAX;
+    for (size_t i = 0; i < s->index_count; i++)
+        if (strcmp(s->indexes[i].cls, cls) == 0 &&
+            strcmp(s->indexes[i].field, field) == 0)
+            return i;
+    return SIZE_MAX;
+}
+
+static bool index_bucket_ensure_cap(PogIndexBucket *b)
+{
+    if (b->count < b->cap) return true;
+    size_t nc, bytes;
+    if (!next_cap(b->cap, 4, &nc) || !mul_bytes(nc, sizeof(*b->entries), &bytes))
+        return false;
+    PogIndexEntry *a = realloc(b->entries, bytes);
+    if (!a) return false;
+    b->entries = a; b->cap = nc;
+    return true;
+}
+
+static bool index_entry_append_item(PogIndexEntry *e, Object *o)
+{
+    if (e->count >= e->cap) {
+        size_t nc, bytes;
+        if (!next_cap(e->cap, 8, &nc) || !mul_bytes(nc, sizeof(*e->items), &bytes))
+            return false;
+        Object **a = realloc(e->items, bytes);
+        if (!a) return false;
+        e->items = a; e->cap = nc;
+    }
+    e->items[e->count++] = o;
+    return true;
+}
+
+static void index_entry_remove_item(PogIndexEntry *e, Object *o)
+{
+    for (size_t i = 0; i < e->count; i++) {
+        if (e->items[i] == o) {
+            e->items[i] = e->items[e->count - 1];   /* swap-and-pop */
+            e->count--;
+            return;
+        }
+    }
+}
+
+/* bucket_count is always a power of two (0 initially, then only ever set
+ * by index_rehash below, starting at 8) — nothing else may assign it,
+ * since index_find_entry_unlocked relies on that for `& (bucket_count-1)`
+ * to be a valid substitute for `% bucket_count`. */
+static PogIndexEntry *index_find_entry_unlocked(PogIndex *idx, const char *value)
+{
+    if (idx->bucket_count == 0) return NULL;
+    uint64_t h = pog_fnv1a(value);
+    size_t b = (size_t)(h & (uint64_t)(idx->bucket_count - 1));
+    PogIndexBucket *bucket = &idx->buckets[b];
+    for (size_t i = 0; i < bucket->count; i++)
+        if (strcmp(bucket->entries[i].value, value) == 0)
+            return &bucket->entries[i];
+    return NULL;
+}
+
+/* Atomic rehash: idx is only mutated in the final phase, after every
+ * allocation needed for the new layout has already succeeded — so an OOM
+ * at any earlier phase leaves idx completely untouched. */
+static bool index_rehash(PogIndex *idx, size_t new_bucket_count)
+{
+    if (idx->total_entries == 0) {
+        size_t bytes;
+        if (!mul_bytes(new_bucket_count, sizeof(PogIndexBucket), &bytes)) return false;
+        PogIndexBucket *nb = calloc(1, bytes);
+        if (!nb) return false;
+        free(idx->buckets);
+        idx->buckets = nb;
+        idx->bucket_count = new_bucket_count;
+        return true;
+    }
+
+    /* Phase 1: flatten every existing entry into a temp array. Old
+     * buckets are only read here, not freed. */
+    size_t total = idx->total_entries;
+    size_t tmp_bytes;
+    if (!mul_bytes(total, sizeof(PogIndexEntry), &tmp_bytes)) return false;
+    PogIndexEntry *tmp = malloc(tmp_bytes);
+    if (!tmp) return false;
+    size_t w = 0;
+    for (size_t b = 0; b < idx->bucket_count; b++)
+        for (size_t e = 0; e < idx->buckets[b].count; e++)
+            tmp[w++] = idx->buckets[b].entries[e];
+
+    /* Phase 2: compute each entry's target bucket under the new size and
+     * tally per-bucket counts (counting only, no final allocation yet). */
+    size_t *target = malloc(total * sizeof(size_t));
+    size_t *bucket_counts = calloc(new_bucket_count, sizeof(size_t));
+    if (!target || !bucket_counts) {
+        free(tmp); free(target); free(bucket_counts); return false;
+    }
+    for (size_t i = 0; i < total; i++) {
+        uint64_t h = pog_fnv1a(tmp[i].value);
+        size_t b = (size_t)(h & (uint64_t)(new_bucket_count - 1));
+        target[i] = b;
+        bucket_counts[b]++;
+    }
+
+    /* Phase 3: reserve — allocate each new bucket's entries array to its
+     * exact final size. Allocation only, no writes; a failure here is
+     * fully recoverable since idx/old buckets are still intact. */
+    PogIndexBucket *nb = calloc(new_bucket_count, sizeof(PogIndexBucket));
+    if (!nb) { free(tmp); free(target); free(bucket_counts); return false; }
+    bool ok = true;
+    for (size_t b = 0; b < new_bucket_count && ok; b++) {
+        if (bucket_counts[b] == 0) continue;
+        size_t bytes;
+        if (!mul_bytes(bucket_counts[b], sizeof(PogIndexEntry), &bytes)) { ok = false; break; }
+        nb[b].entries = malloc(bytes);
+        if (!nb[b].entries) { ok = false; break; }
+        nb[b].cap = bucket_counts[b];
+    }
+    if (!ok) {
+        for (size_t b = 0; b < new_bucket_count; b++) free(nb[b].entries);
+        free(nb); free(tmp); free(target); free(bucket_counts);
+        return false;   /* idx completely untouched */
+    }
+
+    /* Phase 4: commit — copy each entry into its reserved slot. Cannot
+     * fail: pure copy, capacity already reserved in phase 3. */
+    for (size_t i = 0; i < total; i++) {
+        size_t b = target[i];
+        nb[b].entries[nb[b].count++] = tmp[i];
+    }
+
+    /* Phase 5: swap in the new table. Free only the OLD shell arrays —
+     * entry internals (value/items) were relocated by value into nb, not
+     * duplicated, so this cannot double-free. */
+    for (size_t b = 0; b < idx->bucket_count; b++) free(idx->buckets[b].entries);
+    free(idx->buckets);
+    idx->buckets = nb;
+    idx->bucket_count = new_bucket_count;
+
+    free(tmp); free(target); free(bucket_counts);
+    return true;
+}
+
+static bool index_maybe_grow(PogIndex *idx)
+{
+    if (idx->bucket_count != 0 && idx->total_entries < idx->bucket_count) return true;
+    size_t nc;
+    if (!next_cap(idx->bucket_count, 8, &nc)) return false;
+    return index_rehash(idx, nc);
+}
+
+static bool index_insert_unlocked(PogIndex *idx, const char *value, Object *o)
+{
+    PogIndexEntry *e = index_find_entry_unlocked(idx, value);
+    if (e) return index_entry_append_item(e, o);
+
+    if (!index_maybe_grow(idx)) return false;
+
+    uint64_t h = pog_fnv1a(value);
+    size_t b = (size_t)(h & (uint64_t)(idx->bucket_count - 1));
+    PogIndexBucket *bucket = &idx->buckets[b];
+
+    /* Build the new entry fully in a local before touching the live
+     * bucket — a failure here leaves the bucket completely unchanged. */
+    PogIndexEntry ne = {0};
+    ne.value = strdup(value);
+    if (!ne.value) return false;
+    if (!index_entry_append_item(&ne, o)) { free(ne.value); return false; }
+    if (!index_bucket_ensure_cap(bucket)) { free(ne.value); free(ne.items); return false; }
+
+    bucket->entries[bucket->count++] = ne;
+    idx->total_entries++;
+    return true;
+}
+
+static void index_remove_unlocked(PogIndex *idx, const char *value, Object *o)
+{
+    PogIndexEntry *e = index_find_entry_unlocked(idx, value);
+    if (!e) return;
+    index_entry_remove_item(e, o);
+}
+
+static void index_free_contents(PogIndex *idx)
+{
+    for (size_t b = 0; b < idx->bucket_count; b++) {
+        for (size_t e = 0; e < idx->buckets[b].count; e++) {
+            free(idx->buckets[b].entries[e].value);
+            free(idx->buckets[b].entries[e].items);
+        }
+        free(idx->buckets[b].entries);
+    }
+    free(idx->buckets);
+    idx->buckets = NULL; idx->bucket_count = 0; idx->total_entries = 0;
+}
+
+static void index_free_all(PogIndex *idx)
+{
+    index_free_contents(idx);
+    free(idx->cls); free(idx->field);
+    idx->cls = idx->field = NULL;
+}
+
+/* Rebuild one index's CONTENTS from current live state (keeps the
+ * declaration — cls/field — intact). Scans through the already-rebuilt
+ * class index rather than s->objects: O(class size), not O(store size).
+ * Returns false on allocation failure mid-build; index_create checks this
+ * (fallible, all-or-nothing), index_rebuild_all deliberately ignores it
+ * (best-effort, matching class_index_rebuild's own precedent of ignoring
+ * class_list_append's return value) — do not "fix" one call site to
+ * match the other. */
+static bool index_rebuild_one_unlocked(Store *s, PogIndex *idx)
+{
+    index_free_contents(idx);
+    size_t ci = class_find_idx(s, idx->cls);
+    if (ci == SIZE_MAX) return true;   /* class has no instances (yet) */
+    size_t n = s->class_counts[ci];
+    for (size_t i = 0; i < n; i++) {
+        Object *o = s->class_instances[ci][i];
+        Field *f = find_field(o, idx->field);
+        if (f && f->value && f->value->kind == OBJ_STRING) {
+            if (!index_insert_unlocked(idx, f->value->str_value, o))
+                return false;
+        }
+    }
+    return true;
+}
+
+/* Rebuild ALL declared indexes' contents from current live state. Call
+ * immediately after every class_index_rebuild(s) call site — depends on
+ * the class index already being fresh. */
+static void index_rebuild_all(Store *s)
+{
+    for (size_t i = 0; i < s->index_count; i++)
+        (void)index_rebuild_one_unlocked(s, &s->indexes[i]);
+}
+
+/* Remove o from every index declared on cls_name, among s->indexes[0..upto),
+ * wherever o currently has a string value at that index's field. Used both
+ * for a bounded partial-unwind (upto == the index where an insert loop
+ * failed) and a full unwind/removal (upto == s->index_count) by
+ * set_class_unlocked_impl. */
+static void index_unwind_class_inserts(Store *s, size_t upto, const char *cls_name, Object *o)
+{
+    for (size_t i = 0; i < upto; i++) {
+        PogIndex *idx = &s->indexes[i];
+        if (strcmp(idx->cls, cls_name) != 0) continue;
+        Field *f = find_field(o, idx->field);
+        if (!f || !f->value || f->value->kind != OBJ_STRING) continue;
+        index_remove_unlocked(idx, f->value->str_value, o);
+    }
+}
+
+static bool index_create_unlocked(Store *s, const char *cls, const char *field)
+{
+    if (!s || !cls || !*cls || !field || !*field) return false;
+    if (strlen(field) >= POG_MAX_KEY_LEN) return false;
+    if (strlen(cls) >= POG_MAX_CLASS_NAME) return false;
+
+    if (index_find_idx_unlocked(s, cls, field) != SIZE_MAX) return true;  /* idempotent */
+
+    if (!index_ensure_cap(s)) return false;
+    char *cls_dup = strdup(cls);
+    char *field_dup = cls_dup ? strdup(field) : NULL;
+    if (!cls_dup || !field_dup) { free(cls_dup); free(field_dup); return false; }
+
+    size_t i = s->index_count++;
+    s->indexes[i] = (PogIndex){ .cls = cls_dup, .field = field_dup };
+
+    if (!index_rebuild_one_unlocked(s, &s->indexes[i])) {
+        index_free_all(&s->indexes[i]);
+        s->index_count--;
+        return false;
+    }
+    return true;
+}
+
+static bool index_drop_unlocked(Store *s, const char *cls, const char *field)
+{
+    size_t i = index_find_idx_unlocked(s, cls, field);
+    if (i == SIZE_MAX) return false;
+    index_free_all(&s->indexes[i]);
+    s->indexes[i] = s->indexes[--s->index_count];   /* swap-and-pop */
+    return true;
+}
+
+/* ============================================================
  * Locking helpers
  *
  * Convention:
@@ -561,6 +892,11 @@ void store_destroy(Store *s)
     free(s->class_instances);
     free(s->class_counts);
     free(s->class_caps);
+
+    /* secondary hash indexes */
+    for (size_t i = 0; i < s->index_count; i++)
+        index_free_all(&s->indexes[i]);
+    free(s->indexes);
 
     pthread_rwlock_destroy(&s->lock);
     free(s);
@@ -722,6 +1058,31 @@ static bool set_field_unlocked(Object *o, const char *key, Object *value)
     if (!auto_begin(s, &started)) return false;
 
     Field *ex = find_field(o, key);
+
+    /* Secondary-index maintenance: only touches an index declared on this
+     * object's class + this field, if any. Insert-new-before-mutate
+     * (failure needs no unwind of the field itself), remove-old-after-
+     * mutate (cannot fail). same_value guards against re-setting a field
+     * to its current string content, which would otherwise insert a
+     * duplicate Object* into an entry it's already a member of. */
+    PogIndex *idx = NULL;
+    if (o->class_name) {
+        size_t ii = index_find_idx_unlocked(s, o->class_name, key);
+        if (ii != SIZE_MAX) idx = &s->indexes[ii];
+    }
+    const char *old_str = (ex && ex->value && ex->value->kind == OBJ_STRING)
+                           ? ex->value->str_value : NULL;
+    const char *new_str = (value && value->kind == OBJ_STRING)
+                           ? value->str_value : NULL;
+    bool same_value = old_str && new_str && strcmp(old_str, new_str) == 0;
+
+    if (idx && new_str && !same_value) {
+        if (!index_insert_unlocked(idx, new_str, o)) {
+            auto_end(s, started, false);
+            return false;
+        }
+    }
+
     TxnRec r = {0};
     r.op = WOP_SET_FIELD; r.target = o; r.target_id = o->id;
     strncpy(r.key, key, POG_MAX_KEY_LEN - 1);
@@ -731,12 +1092,19 @@ static bool set_field_unlocked(Object *o, const char *key, Object *value)
         r.had_prev = true; r.old_ref = ex->value;
         ex->value = value;
     } else {
-        if (!composite_grow(o)) { auto_end(s, started, false); return false; }
+        if (!composite_grow(o)) {
+            if (idx && new_str && !same_value) index_remove_unlocked(idx, new_str, o);
+            auto_end(s, started, false);
+            return false;
+        }
         Field *f = &o->composite.items[o->composite.count++];
         memset(f, 0, sizeof(*f));
         strncpy(f->key, key, POG_MAX_KEY_LEN - 1);
         f->value = value;
     }
+
+    if (idx && old_str && !same_value)
+        index_remove_unlocked(idx, old_str, o);
 
     log_push(s, r);
     return auto_end(s, started, true);
@@ -1110,6 +1478,7 @@ static void gc_unlocked(Store *s)
     s->count = w;
     /* GC may have freed tagged objects; rebuild the class index. */
     class_index_rebuild(s);
+    index_rebuild_all(s);
 }
 
 void gc(Store *s)
@@ -1465,6 +1834,7 @@ Store *load(const char *path)
     s->next_id = next_id;
     s->seq = seq;
     class_index_rebuild(s);
+    index_rebuild_all(s);
     return s;
 }
 
@@ -2036,6 +2406,7 @@ static bool txn_abort_unlocked_impl(Store *s)
     /* Any class-index entries for the freed objects are now dangling.
      * Rebuild the index from surviving object state. */
     class_index_rebuild(s);
+    index_rebuild_all(s);
 
     /* Roots added after begin should be dropped (unused marker) — but our
      * undo already marks them unused. Also shrink root_count to drop any
@@ -2148,6 +2519,7 @@ Store *store_open(const char *path)
 
     /* WAL replay may have created newly-tagged composites; rebuild index. */
     class_index_rebuild(s);
+    index_rebuild_all(s);
 
     /* 3) Truncate any torn tail from WAL so new writes append cleanly. */
     if (stat(wp, &st) == 0 && good_end > 0 && good_end < st.st_size) {
@@ -2658,6 +3030,90 @@ const VListOps pog_cidr_subnets = {
     .at        = cidr_subnets_at,
 };
 
+/* ---------- dns.ancestors / dns.wildcards ---------- */
+
+static bool dns_get_name(Object *params, const char **out)
+{
+    if (!params || params->kind != OBJ_COMPOSITE) return false;
+    Object *nf = get_field_unlocked(params, "name");
+    if (!nf || nf->kind != OBJ_STRING) return false;
+    *out = nf->str_value ? nf->str_value : "";
+    return true;
+}
+
+static size_t dns_label_count(const char *name)
+{
+    if (!name || !*name) return 0;
+    size_t n = 1;
+    for (const char *p = name; *p; p++) if (*p == '.') n++;
+    return n;
+}
+
+/* Suffix after skipping `skip` leading labels; skip == label_count lands
+ * exactly on the trailing NUL (""), since the last label has no dot. */
+static const char *dns_skip_labels(const char *name, size_t skip)
+{
+    const char *p = name;
+    for (size_t i = 0; i < skip; i++) {
+        const char *dot = strchr(p, '.');
+        if (!dot) return p + strlen(p);
+        p = dot + 1;
+    }
+    return p;
+}
+
+static size_t dns_ancestors_len(Object *self)
+{
+    const char *name;
+    if (!dns_get_name(self->vlist.params, &name)) return 0;
+    return dns_label_count(name) + 1;
+}
+
+static Object *dns_ancestors_at(Object *self, size_t i)
+{
+    const char *name;
+    if (!dns_get_name(self->vlist.params, &name)) return NULL;
+    if (i > dns_label_count(name)) return NULL;
+    return pog_vlist_emit_string(self, dns_skip_labels(name, i));
+}
+
+const VListOps pog_dns_ancestors = {
+    .type_name = "dns.ancestors",
+    .len       = dns_ancestors_len,
+    .at        = dns_ancestors_at,
+};
+
+static size_t dns_wildcards_len(Object *self)
+{
+    const char *name;
+    if (!dns_get_name(self->vlist.params, &name)) return 0;
+    size_t lc = dns_label_count(name);
+    return (lc >= 1) ? lc - 1 : 0;   /* guarded — size_t underflow otherwise */
+}
+
+static Object *dns_wildcards_at(Object *self, size_t i)
+{
+    const char *name;
+    if (!dns_get_name(self->vlist.params, &name)) return NULL;
+    size_t lc = dns_label_count(name);
+    size_t wlen = (lc >= 1) ? lc - 1 : 0;
+    if (i >= wlen) return NULL;
+    const char *suffix = dns_skip_labels(name, i + 1);
+    size_t n = 2 + strlen(suffix) + 1;
+    char *buf = malloc(n);
+    if (!buf) return NULL;
+    snprintf(buf, n, "*.%s", suffix);
+    Object *r = pog_vlist_emit_string(self, buf);
+    free(buf);
+    return r;
+}
+
+const VListOps pog_dns_wildcards = {
+    .type_name = "dns.wildcards",
+    .len       = dns_wildcards_len,
+    .at        = dns_wildcards_at,
+};
+
 /* ---------- registration ---------- */
 
 void pog_register_builtins(void)
@@ -2667,6 +3123,8 @@ void pog_register_builtins(void)
     pog_register_vlist_type(&pog_cidr_all);
     pog_register_vlist_type(&pog_cidr_free);
     pog_register_vlist_type(&pog_cidr_subnets);
+    pog_register_vlist_type(&pog_dns_ancestors);
+    pog_register_vlist_type(&pog_dns_wildcards);
 }
 
 /* ============================================================
@@ -2698,9 +3156,34 @@ static bool set_class_unlocked_impl(Object *o, const char *new_name)
     bool started;
     if (!auto_begin(s, &started)) return false;
 
+    /* Secondary-index maintenance, phase 1: speculatively insert o into
+     * every index declared on the NEW class, before touching class_name
+     * or the class-membership lists at all. A mid-loop failure then only
+     * needs a bounded partial-unwind of this same loop — no interaction
+     * with the class-list unwind cascade below. */
+    if (want_tag) {
+        size_t failed_at = SIZE_MAX;
+        for (size_t i = 0; i < s->index_count; i++) {
+            PogIndex *idx = &s->indexes[i];
+            if (strcmp(idx->cls, new_name) != 0) continue;
+            Field *f = find_field(o, idx->field);
+            if (!f || !f->value || f->value->kind != OBJ_STRING) continue;
+            if (!index_insert_unlocked(idx, f->value->str_value, o)) { failed_at = i; break; }
+        }
+        if (failed_at != SIZE_MAX) {
+            index_unwind_class_inserts(s, failed_at, new_name, o);
+            auto_end(s, started, false);
+            return false;
+        }
+    }
+
     /* Save old value for undo. */
     char *saved_old = old_name ? strdup(old_name) : NULL;
-    if (old_name && !saved_old) { auto_end(s, started, false); return false; }
+    if (old_name && !saved_old) {
+        if (want_tag) index_unwind_class_inserts(s, s->index_count, new_name, o);
+        auto_end(s, started, false);
+        return false;
+    }
 
     /* Remove from old class's list */
     if (old_name) {
@@ -2719,6 +3202,7 @@ static bool set_class_unlocked_impl(Object *o, const char *new_name)
                 size_t oi = class_get_or_create(s, old_name);
                 if (oi != SIZE_MAX) class_list_append(s, oi, o);
             }
+            index_unwind_class_inserts(s, s->index_count, new_name, o);
             free(saved_old);
             auto_end(s, started, false);
             return false;
@@ -2738,10 +3222,20 @@ static bool set_class_unlocked_impl(Object *o, const char *new_name)
                 size_t oi = class_get_or_create(s, o->class_name);
                 if (oi != SIZE_MAX) class_list_append(s, oi, o);
             }
+            index_unwind_class_inserts(s, s->index_count, new_name, o);
             auto_end(s, started, false);
             return false;
         }
     }
+
+    /* Secondary-index maintenance, phase 2: now that everything else has
+     * succeeded, remove o from every index declared on the OLD class.
+     * Reuses the same helper for its literal job (not as an unwind);
+     * cannot fail (swap-and-pop only). Uses saved_old, not old_name: the
+     * latter was a borrowed pointer into o->class_name, which was just
+     * free()'d and reassigned above — old_name is dangling here. */
+    if (saved_old)
+        index_unwind_class_inserts(s, s->index_count, saved_old, o);
 
     /* WAL record */
     TxnRec r = {0};
@@ -2961,9 +3455,73 @@ Object *find_by_field(Store *s, const char *class_name,
                       const char *key, const char *value)
 {
     if (!s || !class_name || !key || !value) return NULL;
+
+    /* Fast path: an index declared on (class_name, key) makes this O(1).
+     * Check and release the lock before falling back to query_class,
+     * which takes LOCK_R itself — holding LOCK_R across that call would
+     * be a nested rdlock on one non-recursive pthread_rwlock_t from this
+     * thread, a real deadlock hazard under writer contention. */
+    LOCK_R(s);
+    size_t ii = index_find_idx_unlocked(s, class_name, key);
+    if (ii != SIZE_MAX) {
+        PogIndexEntry *e = index_find_entry_unlocked(&s->indexes[ii], value);
+        Object *found = (e && e->count > 0) ? e->items[0] : NULL;
+        UNLOCK_R(s);
+        return found;
+    }
+    UNLOCK_R(s);
+
     fbf_state st = { key, value, NULL };
     query_class(s, class_name, fbf_cb, &st);
     return st.found;
+}
+
+/* ---- secondary hash index: public wrappers ---- */
+
+size_t index_lookup(Store *s, const char *cls, const char *field,
+                    const char *value, query_fn cb, void *ud)
+{
+    if (!s || !cls || !field || !value || !cb) return 0;
+    LOCK_R(s);
+    size_t ii = index_find_idx_unlocked(s, cls, field);
+    if (ii == SIZE_MAX) { UNLOCK_R(s); return 0; }
+    PogIndexEntry *e = index_find_entry_unlocked(&s->indexes[ii], value);
+    size_t n = e ? e->count : 0;
+    Object **snap = NULL;
+    if (n > 0) {
+        snap = malloc(n * sizeof(*snap));
+        if (!snap) { UNLOCK_R(s); return 0; }
+        memcpy(snap, e->items, n * sizeof(*snap));
+    }
+    UNLOCK_R(s);
+
+    size_t visited = 0;
+    for (size_t i = 0; i < n; i++) {
+        visited++;
+        if (!cb(snap[i], ud)) break;
+    }
+    free(snap);
+    return visited;
+}
+
+Object *index_lookup_one(Store *s, const char *cls, const char *field,
+                         const char *value)
+{
+    if (!s || !cls || !field || !value) return NULL;
+    LOCK_R(s);
+    size_t ii = index_find_idx_unlocked(s, cls, field);
+    if (ii == SIZE_MAX) { UNLOCK_R(s); return NULL; }
+    PogIndexEntry *e = index_find_entry_unlocked(&s->indexes[ii], value);
+    Object *r = (e && e->count > 0) ? e->items[0] : NULL;
+    UNLOCK_R(s);
+    return r;
+}
+
+bool index_create(Store *s, const char *cls, const char *field) {
+    LOCK_W(s); bool r = index_create_unlocked(s, cls, field); UNLOCK_W(s); return r;
+}
+bool index_drop(Store *s, const char *cls, const char *field) {
+    LOCK_W(s); bool r = index_drop_unlocked(s, cls, field); UNLOCK_W(s); return r;
 }
 
 /* ============================================================

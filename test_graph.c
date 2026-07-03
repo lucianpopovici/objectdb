@@ -1424,6 +1424,535 @@ static void test_class_txn_abort(void)
 }
 
 /* =======================================================
+ * Phase 13: Secondary hash index (1a) + dns.* vlists (1b)
+ * ======================================================= */
+
+typedef struct { Object **items; size_t count, cap; } obj_collect;
+static bool collect_cb(Object *o, void *ud)
+{
+    obj_collect *c = ud;
+    if (c->count < c->cap) c->items[c->count] = o;
+    c->count++;
+    return true;
+}
+
+static void test_index_basic_lookup(void)
+{
+    SECTION("index: create + lookup correctness + miss");
+    Store *s = store_create();
+    Object *a = new_object(s); set_class(a, "User");
+    set_field(a, "email", new_string(s, "alice@example.com"));
+    Object *b = new_object(s); set_class(b, "User");
+    set_field(b, "email", new_string(s, "bob@example.com"));
+
+    CHECK(index_create(s, "User", "email"));
+    CHECK(index_lookup_one(s, "User", "email", "alice@example.com") == a);
+    CHECK(index_lookup_one(s, "User", "email", "bob@example.com")   == b);
+    CHECK(index_lookup_one(s, "User", "email", "carol@example.com") == NULL);
+
+    Object *found[4] = {0};
+    obj_collect oc = { found, 0, 4 };
+    size_t visited = index_lookup(s, "User", "email", "alice@example.com", collect_cb, &oc);
+    CHECK(visited == 1);
+    CHECK(oc.count == 1);
+    CHECK(found[0] == a);
+    store_destroy(s);
+}
+
+static void test_index_nonunique_values(void)
+{
+    SECTION("index: multiple objects sharing one value");
+    Store *s = store_create();
+    Object *a = new_object(s); set_class(a, "Host");
+    set_field(a, "ip", new_string(s, "10.0.0.1"));
+    Object *b = new_object(s); set_class(b, "Host");
+    set_field(b, "ip", new_string(s, "10.0.0.1"));
+    Object *c = new_object(s); set_class(c, "Host");
+    set_field(c, "ip", new_string(s, "10.0.0.2"));
+
+    CHECK(index_create(s, "Host", "ip"));
+    Object *found[4] = {0};
+    obj_collect oc = { found, 0, 4 };
+    size_t visited = index_lookup(s, "Host", "ip", "10.0.0.1", collect_cb, &oc);
+    CHECK(visited == 2);
+    CHECK(oc.count == 2);
+    CHECK((found[0] == a && found[1] == b) || (found[0] == b && found[1] == a));
+
+    oc = (obj_collect){ found, 0, 4 };
+    visited = index_lookup(s, "Host", "ip", "10.0.0.2", collect_cb, &oc);
+    CHECK(visited == 1);
+    CHECK(found[0] == c);
+    store_destroy(s);
+}
+
+static void test_index_set_field_maintenance(void)
+{
+    SECTION("index: maintained across set_field, including same-value reset");
+    Store *s = store_create();
+    Object *a = new_object(s); set_class(a, "User");
+    set_field(a, "email", new_string(s, "alice@example.com"));
+    CHECK(index_create(s, "User", "email"));
+    CHECK(index_lookup_one(s, "User", "email", "alice@example.com") == a);
+
+    set_field(a, "email", new_string(s, "alice2@example.com"));
+    CHECK(index_lookup_one(s, "User", "email", "alice@example.com") == NULL);
+    CHECK(index_lookup_one(s, "User", "email", "alice2@example.com") == a);
+
+    /* regression: reset to an equal-content-but-different string object
+     * must not create a duplicate entry */
+    set_field(a, "email", new_string(s, "alice2@example.com"));
+    Object *found[4] = {0};
+    obj_collect oc = { found, 0, 4 };
+    size_t visited = index_lookup(s, "User", "email", "alice2@example.com", collect_cb, &oc);
+    CHECK(visited == 1);
+    CHECK(oc.count == 1);
+    store_destroy(s);
+}
+
+static void test_index_set_class_maintenance(void)
+{
+    SECTION("index: maintained across set_class tag/retag/untag");
+    Store *s = store_create();
+    Object *a = new_object(s);
+    set_field(a, "name", new_string(s, "www.example.com"));
+    CHECK(index_create(s, "RR", "name"));
+    CHECK(index_lookup_one(s, "RR", "name", "www.example.com") == NULL);
+
+    set_class(a, "RR");
+    CHECK(index_lookup_one(s, "RR", "name", "www.example.com") == a);
+
+    set_class(a, "Other");
+    CHECK(index_lookup_one(s, "RR", "name", "www.example.com") == NULL);
+
+    set_class(a, "RR");
+    CHECK(index_lookup_one(s, "RR", "name", "www.example.com") == a);
+
+    unset_class(a);
+    CHECK(index_lookup_one(s, "RR", "name", "www.example.com") == NULL);
+    store_destroy(s);
+}
+
+static void test_index_txn_commit(void)
+{
+    SECTION("index: maintained across explicit commit");
+    Store *s = store_create();
+    Object *a = new_object(s); set_class(a, "User");
+    CHECK(index_create(s, "User", "email"));
+
+    CHECK(txn_begin(s));
+    set_field(a, "email", new_string(s, "x@example.com"));
+    CHECK(index_lookup_one(s, "User", "email", "x@example.com") == a);
+    CHECK(txn_commit(s));
+    CHECK(index_lookup_one(s, "User", "email", "x@example.com") == a);
+    store_destroy(s);
+}
+
+static void test_index_txn_abort(void)
+{
+    SECTION("index: maintained across explicit abort");
+    Store *s = store_create();
+    Object *a = new_object(s); set_class(a, "User");
+    set_field(a, "email", new_string(s, "before@example.com"));
+    CHECK(index_create(s, "User", "email"));
+    CHECK(index_lookup_one(s, "User", "email", "before@example.com") == a);
+
+    CHECK(txn_begin(s));
+    set_field(a, "email", new_string(s, "during@example.com"));
+    CHECK(index_lookup_one(s, "User", "email", "during@example.com") == a);
+    CHECK(txn_abort(s));
+
+    CHECK(index_lookup_one(s, "User", "email", "during@example.com") == NULL);
+    CHECK(index_lookup_one(s, "User", "email", "before@example.com") == a);
+    store_destroy(s);
+}
+
+static void test_index_gc(void)
+{
+    SECTION("index: maintained across GC");
+    Store *s = store_create();
+    Object *root = new_object(s);
+    bind(s, "R", root);
+    Object *live = new_object(s);
+    set_field(root, "live", live);
+    set_class(live, "Item");
+    set_field(live, "name", new_string(s, "keep"));
+
+    Object *orphan = new_object(s);
+    set_class(orphan, "Item");
+    set_field(orphan, "name", new_string(s, "gone"));
+
+    CHECK(index_create(s, "Item", "name"));
+    CHECK(index_lookup_one(s, "Item", "name", "keep") == live);
+    CHECK(index_lookup_one(s, "Item", "name", "gone") == orphan);
+
+    gc(s);
+
+    CHECK(index_lookup_one(s, "Item", "name", "keep") == live);
+    CHECK(index_lookup_one(s, "Item", "name", "gone") == NULL);
+    store_destroy(s);
+}
+
+static void test_index_create_idempotent(void)
+{
+    SECTION("index: create idempotency");
+    Store *s = store_create();
+    Object *a = new_object(s); set_class(a, "User");
+    set_field(a, "email", new_string(s, "a@example.com"));
+    CHECK(index_create(s, "User", "email"));
+    CHECK(index_create(s, "User", "email"));
+    CHECK(index_lookup_one(s, "User", "email", "a@example.com") == a);
+    store_destroy(s);
+}
+
+static void test_index_drop_and_fallback(void)
+{
+    SECTION("index: drop + find_by_field scan-fallback");
+    Store *s = store_create();
+    Object *a = new_object(s); set_class(a, "User");
+    set_field(a, "email", new_string(s, "a@example.com"));
+    CHECK(index_create(s, "User", "email"));
+    CHECK(find_by_field(s, "User", "email", "a@example.com") == a);
+
+    CHECK(index_drop(s, "User", "email"));
+    CHECK(!index_drop(s, "User", "email"));
+
+    CHECK(find_by_field(s, "User", "email", "a@example.com") == a);
+    CHECK(index_lookup_one(s, "User", "email", "a@example.com") == NULL);
+    store_destroy(s);
+}
+
+static void test_index_not_persisted(void)
+{
+    SECTION("index: declarations not persisted across store_open reopen");
+    const char *p = "/tmp/pog_index_reopen.bin";
+    rm_both(p);
+
+    Store *s = store_open(p);
+    Object *a = new_object(s); set_class(a, "User");
+    set_field(a, "email", new_string(s, "a@example.com"));
+    bind(s, "A", a);
+    CHECK(index_create(s, "User", "email"));
+    CHECK(index_lookup_one(s, "User", "email", "a@example.com") == a);
+    store_close(s);
+
+    Store *s2 = store_open(p);
+    CHECK(index_lookup_one(s2, "User", "email", "a@example.com") == NULL);
+    Object *a2 = get(s2, "A");
+    CHECK(find_by_field(s2, "User", "email", "a@example.com") == a2);
+
+    CHECK(index_create(s2, "User", "email"));
+    CHECK(index_lookup_one(s2, "User", "email", "a@example.com") == a2);
+    store_close(s2);
+    rm_both(p);
+}
+
+static void test_index_find_by_field_equivalence(void)
+{
+    SECTION("index: find_by_field behaves the same with/without a declared index");
+    Store *s = store_create();
+    Object *a = new_object(s); set_class(a, "User");
+    set_field(a, "email", new_string(s, "a@example.com"));
+    Object *b = new_object(s); set_class(b, "User");
+    set_field(b, "email", new_string(s, "b@example.com"));
+
+    CHECK(find_by_field(s, "User", "email", "a@example.com") == a);
+    CHECK(find_by_field(s, "User", "email", "missing@example.com") == NULL);
+
+    CHECK(index_create(s, "User", "email"));
+    CHECK(find_by_field(s, "User", "email", "a@example.com") == a);
+    CHECK(find_by_field(s, "User", "email", "b@example.com") == b);
+    CHECK(find_by_field(s, "User", "email", "missing@example.com") == NULL);
+    store_destroy(s);
+}
+
+static void test_index_create_mid_txn_abort(void)
+{
+    SECTION("index: create mid-transaction, then abort -- contents still correct");
+    Store *s = store_create();
+    Object *a = new_object(s); set_class(a, "User");
+    set_field(a, "email", new_string(s, "a@example.com"));
+
+    CHECK(txn_begin(s));
+    CHECK(index_create(s, "User", "email"));
+    CHECK(index_lookup_one(s, "User", "email", "a@example.com") == a);
+    Object *b = new_object(s); set_class(b, "User");
+    set_field(b, "email", new_string(s, "b@example.com"));
+    CHECK(index_lookup_one(s, "User", "email", "b@example.com") == b);
+    CHECK(txn_abort(s));
+
+    CHECK(index_lookup_one(s, "User", "email", "a@example.com") == a);
+    CHECK(index_lookup_one(s, "User", "email", "b@example.com") == NULL);
+    store_destroy(s);
+}
+
+static void test_index_non_string_field_excluded(void)
+{
+    SECTION("index: non-string field values are silently excluded");
+    Store *s = store_create();
+    Object *a = new_object(s); set_class(a, "User");
+    set_field(a, "age", new_int(s, 30));
+    Object *b = new_object(s); set_class(b, "User");
+    set_field(b, "age", new_string(s, "30"));
+
+    CHECK(index_create(s, "User", "age"));
+    CHECK(index_lookup_one(s, "User", "age", "30") == b);
+
+    Object *found[4] = {0};
+    obj_collect oc = { found, 0, 4 };
+    size_t visited = index_lookup(s, "User", "age", "30", collect_cb, &oc);
+    CHECK(visited == 1);
+    CHECK(found[0] == b);
+    store_destroy(s);
+}
+
+static void test_index_rehash_correctness(void)
+{
+    SECTION("index: rehash correctness under load (~50 distinct values)");
+    Store *s = store_create();
+    Object *objs[50];
+    char buf[32];
+    for (int i = 0; i < 50; i++) {
+        objs[i] = new_object(s);
+        set_class(objs[i], "Item");
+        snprintf(buf, sizeof(buf), "item-%d", i);
+        set_field(objs[i], "key", new_string(s, buf));
+    }
+    CHECK(index_create(s, "Item", "key"));
+
+    for (int i = 0; i < 50; i++) {
+        snprintf(buf, sizeof(buf), "item-%d", i);
+        CHECK(index_lookup_one(s, "Item", "key", buf) == objs[i]);
+    }
+    for (int i = 0; i < 50; i += 7) {
+        snprintf(buf, sizeof(buf), "item-%d", i);
+        CHECK(find_by_field(s, "Item", "key", buf) == objs[i]);
+    }
+    store_destroy(s);
+}
+
+static void test_dns_ancestors_multilabel(void)
+{
+    SECTION("vlist: dns.ancestors on a multi-label name");
+    Store *s = store_create();
+    Object *p = new_object(s);
+    set_field(p, "name", new_string(s, "www.example.com"));
+    Object *v = new_vlist(s, "dns.ancestors", p);
+    CHECK(v != NULL);
+    CHECK(list_len(v) == 4);
+    CHECK(strcmp(list_get(v, 0)->str_value, "www.example.com") == 0);
+    CHECK(strcmp(list_get(v, 1)->str_value, "example.com") == 0);
+    CHECK(strcmp(list_get(v, 2)->str_value, "com") == 0);
+    CHECK(strcmp(list_get(v, 3)->str_value, "") == 0);
+    CHECK(list_get(v, 4) == NULL);
+    store_destroy(s);
+}
+
+static void test_dns_ancestors_single_label(void)
+{
+    SECTION("vlist: dns.ancestors on a single-label name");
+    Store *s = store_create();
+    Object *p = new_object(s);
+    set_field(p, "name", new_string(s, "com"));
+    Object *v = new_vlist(s, "dns.ancestors", p);
+    CHECK(list_len(v) == 2);
+    CHECK(strcmp(list_get(v, 0)->str_value, "com") == 0);
+    CHECK(strcmp(list_get(v, 1)->str_value, "") == 0);
+    store_destroy(s);
+}
+
+static void test_dns_ancestors_root(void)
+{
+    SECTION("vlist: dns.ancestors on the root (empty name)");
+    Store *s = store_create();
+    Object *p = new_object(s);
+    set_field(p, "name", new_string(s, ""));
+    Object *v = new_vlist(s, "dns.ancestors", p);
+    CHECK(list_len(v) == 1);
+    CHECK(strcmp(list_get(v, 0)->str_value, "") == 0);
+    store_destroy(s);
+}
+
+static void test_dns_wildcards_multilabel(void)
+{
+    SECTION("vlist: dns.wildcards on a multi-label name");
+    Store *s = store_create();
+    Object *p = new_object(s);
+    set_field(p, "name", new_string(s, "foo.bar.example.com"));
+    Object *v = new_vlist(s, "dns.wildcards", p);
+    CHECK(list_len(v) == 3);
+    CHECK(strcmp(list_get(v, 0)->str_value, "*.bar.example.com") == 0);
+    CHECK(strcmp(list_get(v, 1)->str_value, "*.example.com") == 0);
+    CHECK(strcmp(list_get(v, 2)->str_value, "*.com") == 0);
+    CHECK(list_get(v, 3) == NULL);
+    store_destroy(s);
+}
+
+static void test_dns_wildcards_two_label(void)
+{
+    SECTION("vlist: dns.wildcards degenerate two-label case");
+    Store *s = store_create();
+    Object *p = new_object(s);
+    set_field(p, "name", new_string(s, "example.com"));
+    Object *v = new_vlist(s, "dns.wildcards", p);
+    CHECK(list_len(v) == 1);
+    CHECK(strcmp(list_get(v, 0)->str_value, "*.com") == 0);
+    store_destroy(s);
+}
+
+static void test_dns_wildcards_single_label(void)
+{
+    SECTION("vlist: dns.wildcards on a single-label name yields nothing");
+    Store *s = store_create();
+    Object *p = new_object(s);
+    set_field(p, "name", new_string(s, "com"));
+    Object *v = new_vlist(s, "dns.wildcards", p);
+    CHECK(list_len(v) == 0);
+    CHECK(list_get(v, 0) == NULL);
+    store_destroy(s);
+}
+
+static void test_dns_wildcards_root(void)
+{
+    SECTION("vlist: dns.wildcards on the root (empty name) yields nothing");
+    Store *s = store_create();
+    Object *p = new_object(s);
+    set_field(p, "name", new_string(s, ""));
+    Object *v = new_vlist(s, "dns.wildcards", p);
+    CHECK(list_len(v) == 0);
+    store_destroy(s);
+}
+
+static void test_dns_vlist_persist_save_load(void)
+{
+    SECTION("vlist: dns.ancestors/dns.wildcards persist through save/load");
+    const char *p = "/tmp/pog_dns_vlist_snap.bin";
+    unlink(p);
+
+    Store *s = store_create();
+    Object *rr = new_object(s);
+    set_field(rr, "name", new_string(s, "www.example.com"));
+    set_field(rr, "ancestors", new_vlist(s, "dns.ancestors", rr));
+    set_field(rr, "wildcards", new_vlist(s, "dns.wildcards", rr));
+    bind(s, "RR", rr);
+    CHECK(save(s, p));
+    store_destroy(s);
+
+    Store *s2 = load(p);
+    CHECK(s2 != NULL);
+    Object *rr2 = get(s2, "RR");
+    CHECK(rr2 != NULL);
+    Object *anc2 = get_field(rr2, "ancestors");
+    Object *wc2  = get_field(rr2, "wildcards");
+    CHECK(anc2 && anc2->kind == OBJ_VLIST);
+    CHECK(wc2  && wc2->kind  == OBJ_VLIST);
+    CHECK(list_len(anc2) == 4);
+    CHECK(list_len(wc2)  == 2);
+    CHECK(strcmp(list_get(anc2, 0)->str_value, "www.example.com") == 0);
+    CHECK(strcmp(list_get(wc2, 0)->str_value, "*.example.com") == 0);
+    store_destroy(s2);
+    unlink(p);
+}
+
+static void test_dns_vlist_persist_wal(void)
+{
+    SECTION("vlist: dns.* persists through WAL autocommit + reopen");
+    const char *p = "/tmp/pog_dns_vlist_wal.bin";
+    rm_both(p);
+
+    Store *s = store_open(p);
+    CHECK(s != NULL);
+    Object *rr = new_object(s);
+    set_field(rr, "name", new_string(s, "foo.bar.example.com"));
+    set_field(rr, "wildcards", new_vlist(s, "dns.wildcards", rr));
+    bind(s, "RR", rr);
+    store_close(s);
+
+    Store *s2 = store_open(p);
+    CHECK(s2 != NULL);
+    Object *rr2 = get(s2, "RR");
+    CHECK(rr2 != NULL);
+    Object *wc2 = get_field(rr2, "wildcards");
+    CHECK(wc2 && wc2->kind == OBJ_VLIST);
+    CHECK(list_len(wc2) == 3);
+    CHECK(strcmp(list_get(wc2, 0)->str_value, "*.bar.example.com") == 0);
+    store_close(s2);
+    rm_both(p);
+}
+
+static void test_dns_end_to_end_lookup(void)
+{
+    SECTION("dns: end-to-end lookup algorithm (index + ancestors + wildcards)");
+    Store *s = store_create();
+
+    Object *zone = new_object(s);
+    set_class(zone, "Zone");
+    set_field(zone, "name", new_string(s, "example.com"));
+
+    Object *www = new_object(s);
+    set_class(www, "RRset");
+    set_field(www, "name", new_string(s, "www.example.com"));
+    set_field(www, "type", new_string(s, "A"));
+
+    Object *wild = new_object(s);
+    set_class(wild, "RRset");
+    set_field(wild, "name", new_string(s, "*.example.com"));
+    set_field(wild, "type", new_string(s, "A"));
+
+    CHECK(index_create(s, "RRset", "name"));
+    CHECK(index_create(s, "Zone", "name"));
+
+    /* 1. exact hit */
+    Object *hit = index_lookup_one(s, "RRset", "name", "www.example.com");
+    CHECK(hit == www);
+    CHECK(strcmp(get_field(hit, "type")->str_value, "A") == 0);
+
+    /* 2. no exact name for "missing.example.com" -- walk ancestors to find
+     * the enclosing zone */
+    CHECK(index_lookup_one(s, "RRset", "name", "missing.example.com") == NULL);
+    Object *p = new_object(s);
+    set_field(p, "name", new_string(s, "missing.example.com"));
+    Object *ancestors = new_vlist(s, "dns.ancestors", p);
+    Object *enclosing = NULL;
+    for (size_t i = 0; i < list_len(ancestors); i++) {
+        const char *anc = list_get(ancestors, i)->str_value;
+        Object *z = index_lookup_one(s, "Zone", "name", anc);
+        if (z) { enclosing = z; break; }
+    }
+    CHECK(enclosing == zone);
+
+    /* 3. wildcard synthesis for "missing.example.com" */
+    Object *wildcards = new_vlist(s, "dns.wildcards", p);
+    Object *synth = NULL;
+    for (size_t i = 0; i < list_len(wildcards); i++) {
+        const char *wc = list_get(wildcards, i)->str_value;
+        Object *rr = index_lookup_one(s, "RRset", "name", wc);
+        if (rr) { synth = rr; break; }
+    }
+    CHECK(synth == wild);
+
+    /* 4. true NXDOMAIN: unrelated name, no zone, no wildcard */
+    Object *p2 = new_object(s);
+    set_field(p2, "name", new_string(s, "nope.other.org"));
+    Object *ancestors2 = new_vlist(s, "dns.ancestors", p2);
+    Object *enclosing2 = NULL;
+    for (size_t i = 0; i < list_len(ancestors2); i++) {
+        const char *anc = list_get(ancestors2, i)->str_value;
+        Object *z = index_lookup_one(s, "Zone", "name", anc);
+        if (z) { enclosing2 = z; break; }
+    }
+    CHECK(enclosing2 == NULL);
+    Object *wildcards2 = new_vlist(s, "dns.wildcards", p2);
+    Object *synth2 = NULL;
+    for (size_t i = 0; i < list_len(wildcards2); i++) {
+        const char *wc = list_get(wildcards2, i)->str_value;
+        Object *rr = index_lookup_one(s, "RRset", "name", wc);
+        if (rr) { synth2 = rr; break; }
+    }
+    CHECK(synth2 == NULL);
+    store_destroy(s);
+}
+
+/* =======================================================
  * Phase 12: Process + thread concurrency
  * ======================================================= */
 
@@ -1628,6 +2157,32 @@ int main(void)
     test_class_persistence();
     test_class_wal();
     test_class_txn_abort();
+
+    test_index_basic_lookup();
+    test_index_nonunique_values();
+    test_index_set_field_maintenance();
+    test_index_set_class_maintenance();
+    test_index_txn_commit();
+    test_index_txn_abort();
+    test_index_gc();
+    test_index_create_idempotent();
+    test_index_drop_and_fallback();
+    test_index_not_persisted();
+    test_index_find_by_field_equivalence();
+    test_index_create_mid_txn_abort();
+    test_index_non_string_field_excluded();
+    test_index_rehash_correctness();
+
+    test_dns_ancestors_multilabel();
+    test_dns_ancestors_single_label();
+    test_dns_ancestors_root();
+    test_dns_wildcards_multilabel();
+    test_dns_wildcards_two_label();
+    test_dns_wildcards_single_label();
+    test_dns_wildcards_root();
+    test_dns_vlist_persist_save_load();
+    test_dns_vlist_persist_wal();
+    test_dns_end_to_end_lookup();
 
     test_process_lock();
     test_concurrent_readers_one_writer();
