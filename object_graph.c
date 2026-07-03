@@ -29,6 +29,9 @@
 #define POGW_MAGIC   0x57474F50u   /* "POGW" */
 #define POGW_VERSION 1u
 
+#define POGV_MAGIC   0x56474F50u   /* "POGV" */
+#define POGV_VERSION 1u
+
 enum {
     WOP_TXN_BEGIN   = 1,
     WOP_TXN_COMMIT  = 2,
@@ -884,6 +887,7 @@ void store_destroy(Store *s)
         free(s->active_txn);
     }
     if (s->wal_fp) fclose(s->wal_fp);
+    if (s->vlog_fp) fclose(s->vlog_fp);
     if (s->lock_fd >= 0) {
         /* closing the fd releases the flock automatically */
         close(s->lock_fd);
@@ -2374,6 +2378,204 @@ static bool wal_replay(Store *s, const char *wal_path, IdMap *map, long *good_en
 }
 
 /* ============================================================
+ * Version change log (.vlog) -- durable per-transaction diff history
+ *
+ * Wire format:
+ *   header:  [POGV_MAGIC u32][POGV_VERSION u32]
+ *   record:  [version u32][entry_count u32]
+ *            entry_count * { [object_id u32][is_create u8][class_name:w_str] }
+ *
+ * One record per committed transaction that touched >=1 object.
+ * WOP_BIND_ROOT/WOP_UNBIND_ROOT-only transactions produce no record and
+ * do not bump the version. Append-only, never truncated by
+ * store_checkpoint_unlocked (unlike the WAL) -- that's the whole point:
+ * this history survives checkpoints.
+ * ============================================================ */
+
+typedef struct {
+    uint32_t    object_id;
+    bool        is_create;
+    const char *class_name;   /* borrowed; "" if none/non-composite */
+} VlogPendingEntry;
+
+/* Build the deduplicated entry list for committed transaction t. Excludes
+ * WOP_BIND_ROOT/WOP_UNBIND_ROOT (no target object). O(n^2) linear-scan
+ * dedup -- matches this file's existing style for small bounded per-txn
+ * record counts. class_name is read live from r->target->class_name: by
+ * commit time every mutator has already applied its in-memory change
+ * before calling log_push, so this is always the final post-commit value
+ * regardless of which record for that object we read it from. Runs under
+ * the store's wrlock with GC structurally forbidden while a txn is
+ * active, so every r->target pointer is guaranteed live for the duration.
+ * Returns false only on allocation failure (entries/out_count untouched;
+ * any partial internal buffer already freed) -- caller must skip the
+ * vlog write, warn, and continue (the txn is already durably committed). */
+static bool vlog_build_entries(Txn *t, VlogPendingEntry **out, size_t *out_count)
+{
+    VlogPendingEntry *entries = NULL;
+    size_t count = 0, cap = 0;
+
+    for (size_t i = 0; i < t->count; i++) {
+        TxnRec *r = &t->log[i];
+        if (r->op == WOP_BIND_ROOT || r->op == WOP_UNBIND_ROOT) continue;
+        if (!r->target) continue;
+
+        size_t found = SIZE_MAX;
+        for (size_t j = 0; j < count; j++)
+            if (entries[j].object_id == r->target_id) { found = j; break; }
+        if (found != SIZE_MAX) {
+            entries[found].is_create = entries[found].is_create || r->is_create;
+            continue;
+        }
+
+        if (count >= cap) {
+            size_t nc, bytes;
+            if (!next_cap(cap, 8, &nc) || !mul_bytes(nc, sizeof(*entries), &bytes)) {
+                free(entries); return false;
+            }
+            VlogPendingEntry *a = realloc(entries, bytes);
+            if (!a) { free(entries); return false; }
+            entries = a; cap = nc;
+        }
+        entries[count].object_id  = r->target_id;
+        entries[count].is_create  = r->is_create;
+        entries[count].class_name =
+            (r->target->kind == OBJ_COMPOSITE && r->target->class_name)
+                ? r->target->class_name : "";
+        count++;
+    }
+
+    *out = entries; *out_count = count;
+    return true;
+}
+
+/* Write one .vlog record. No locking -- runs from txn_commit_unlocked_impl,
+ * already under the active txn's wrlock, exactly like wal_write_txn.
+ * Mirrors wal_write_txn's durability discipline (fflush + fsync). */
+static bool vlog_write_record(Store *s, uint32_t version,
+                              const VlogPendingEntry *entries, size_t count)
+{
+    if (!s->vlog_fp) return true;
+    FILE *f = s->vlog_fp;
+
+    bool ok = w_u32(f, version) && w_u32(f, (uint32_t)count);
+    for (size_t i = 0; i < count && ok; i++) {
+        ok = w_u32(f, entries[i].object_id) &&
+             w_u8 (f, entries[i].is_create ? 1 : 0) &&
+             w_str(f, entries[i].class_name);
+    }
+    if (!ok) return false;
+
+    if (fflush(f) != 0) return false;
+    int fd = fileno(f);
+    if (fd >= 0 && fsync(fd) != 0) return false;
+    return true;
+}
+
+typedef struct {
+    uint32_t object_id;
+    bool     is_create;
+    char    *class_name;   /* owned */
+} VlogRecEntry;
+
+/* Same early-stop convention as query_fn (false to stop). class_name
+ * borrowed, valid only for the duration of this call. */
+typedef bool (*vlog_emit_fn)(void *ud, uint32_t version, uint32_t object_id,
+                             bool is_create, const char *class_name);
+
+/* Shared scan/parse core for .vlog, used by BOTH store_open (to determine
+ * s->version and truncate a torn tail) and store_changes_since (to answer
+ * a query) -- the one place this record format is parsed.
+ *
+ * f must be freshly opened at offset 0. since_version: entries with
+ * version > since_version are emitted (0 = everything); only affects
+ * what's passed to emit_entry -- max_version/good_end always reflect the
+ * WHOLE valid prefix regardless. stop_after_version: if nonzero, stop
+ * (cleanly) once a record with version >= stop_after_version has been
+ * fully processed (0 = scan to EOF/torn-tail). emit_entry may be NULL
+ * (store_open's use: only wants max_version/good_end/header_ok).
+ *
+ * Torn-tail handling mirrors wal_replay: a record is speculatively
+ * buffered; only once ALL its entries parse successfully is it
+ * "committed" (max_version/good_end advanced, emit_entry called). Any
+ * failure partway discards that record's buffer and stops, without
+ * having advanced good_end/max_version -- so *good_end always ends up
+ * exactly at the byte offset just past the last fully-valid record,
+ * letting the caller distinguish clean EOF (good_end == file size) from
+ * a torn tail (good_end < file size), same comparison store_open already
+ * makes for the WAL.
+ *
+ * *header_ok is false iff the magic/version header itself didn't parse.
+ * Never fails otherwise; an empty/header-only file yields max_version=0. */
+static void vlog_scan(FILE *f, uint32_t since_version, uint32_t stop_after_version,
+                      vlog_emit_fn emit_entry, void *ud,
+                      uint32_t *max_version, long *good_end, bool *header_ok)
+{
+    *max_version = 0; *good_end = 0; *header_ok = false;
+
+    uint32_t magic, ver;
+    if (!r_u32(f, &magic) || magic != POGV_MAGIC ||
+        !r_u32(f, &ver)   || ver   != POGV_VERSION) {
+        return;
+    }
+    *header_ok = true;
+    *good_end = ftell(f);
+
+    bool stop_requested = false;
+    for (;;) {
+        uint32_t version, count;
+        if (!r_u32(f, &version) || !r_u32(f, &count)) break;
+        if (count > POG_MAX_TXN_RECS_REPLAY) break;
+
+        VlogRecEntry *buf = NULL;
+        size_t bcap = 0;
+        bool ok = true;
+        uint32_t i;
+        for (i = 0; i < count && ok; i++) {
+            uint32_t oid; uint8_t isc; char *cls;
+            if (!r_u32(f, &oid) || !r_u8(f, &isc)) { ok = false; break; }
+            cls = r_str(f);
+            if (!cls) { ok = false; break; }
+            if (i >= bcap) {
+                size_t nc, bytes;
+                if (!next_cap(bcap, 8, &nc) || !mul_bytes(nc, sizeof(*buf), &bytes)) {
+                    free(cls); ok = false; break;
+                }
+                VlogRecEntry *a = realloc(buf, bytes);
+                if (!a) { free(cls); ok = false; break; }
+                buf = a; bcap = nc;
+            }
+            buf[i].object_id = oid; buf[i].is_create = (isc != 0); buf[i].class_name = cls;
+        }
+
+        if (!ok) {
+            for (uint32_t j = 0; j < i; j++) free(buf[j].class_name);
+            free(buf);
+            break;
+        }
+
+        if (version > *max_version) *max_version = version;
+
+        if (emit_entry && version > since_version) {
+            for (uint32_t j = 0; j < count; j++) {
+                if (!emit_entry(ud, version, buf[j].object_id, buf[j].is_create,
+                                buf[j].class_name)) {
+                    stop_requested = true;
+                    break;
+                }
+            }
+        }
+        for (uint32_t j = 0; j < count; j++) free(buf[j].class_name);
+        free(buf);
+
+        *good_end = ftell(f);
+
+        if (stop_requested) break;
+        if (stop_after_version != 0 && version >= stop_after_version) break;
+    }
+}
+
+/* ============================================================
  * Transactions
  * ============================================================ */
 
@@ -2407,6 +2609,31 @@ static bool txn_commit_unlocked_impl(Store *s)
          * public mutator/txn_commit and must never touch the store lock. */
         txn_abort_unlocked_impl(s);
         return false;
+    }
+
+    /* Version change log: one record per committed txn that touched >=1
+     * object. Best-effort only -- the txn is already durably WAL-committed
+     * above, so a vlog failure here must NOT fail/abort it; the version is
+     * simply not advanced, and the next successful write retries the same
+     * version number. */
+    if (s->vlog_fp) {
+        VlogPendingEntry *entries = NULL;
+        size_t entry_count = 0;
+        if (!vlog_build_entries(t, &entries, &entry_count)) {
+            fprintf(stderr, "pog: version log entry build failed for txn %u "
+                            "(out of memory) -- version not advanced\n", t->id);
+        } else {
+            if (entry_count > 0) {
+                uint32_t candidate = s->version + 1;
+                if (vlog_write_record(s, candidate, entries, entry_count)) {
+                    s->version = candidate;
+                } else {
+                    fprintf(stderr, "pog: version log write failed for txn %u "
+                                    "-- version not advanced\n", t->id);
+                }
+            }
+            free(entries);
+        }
     }
 
     for (size_t i = 0; i < t->count; i++) txnrec_free_owned(&t->log[i]);
@@ -2692,6 +2919,49 @@ Store *store_open(const char *path)
         free(wp); store_destroy(s); return NULL;
     }
     free(wp);
+
+    /* 5) Open/bootstrap/scan/truncate .vlog -- separate, dedicated,
+     * never-checkpoint-truncated durable artifact. */
+    char *vp = path_append(path, ".vlog");
+    if (!vp) { store_destroy(s); return NULL; }
+
+    /* Mirrors wal_open_append's exact st.st_size > 0 condition, not just
+     * "stat succeeds" -- correctly re-bootstraps a header if a prior
+     * crash left a zero-length file. */
+    bool vlog_exists = (stat(vp, &st) == 0) && st.st_size > 0;
+    if (!vlog_exists) {
+        FILE *hf = fopen(vp, "wb");
+        if (!hf || !w_u32(hf, POGV_MAGIC) || !w_u32(hf, POGV_VERSION)) {
+            if (hf) fclose(hf);
+            free(vp); store_destroy(s); return NULL;
+        }
+        fflush(hf);
+        { int hfd = fileno(hf); if (hfd >= 0) fsync(hfd); }
+        fclose(hf);
+    }
+
+    FILE *vf = fopen(vp, "rb");
+    if (!vf) { free(vp); store_destroy(s); return NULL; }
+    uint32_t v_max_version; long v_good_end; bool v_header_ok;
+    vlog_scan(vf, 0, 0, NULL, NULL, &v_max_version, &v_good_end, &v_header_ok);
+    fclose(vf);
+    if (!v_header_ok) { free(vp); store_destroy(s); return NULL; }
+    s->version = v_max_version;
+
+    /* Truncate any torn tail -- same pattern as the WAL truncation above. */
+    if (stat(vp, &st) == 0 && v_good_end > 0 && v_good_end < st.st_size) {
+        int fd = open(vp, O_RDWR);
+        if (fd >= 0) {
+            if (ftruncate(fd, v_good_end) != 0) { /* best effort */ }
+            close(fd);
+        }
+    }
+
+    FILE *vaf = fopen(vp, "r+b");
+    if (!vaf) { free(vp); store_destroy(s); return NULL; }
+    fseek(vaf, 0, SEEK_END);
+    s->vlog_fp = vaf;
+    free(vp);
 
     if (s->next_id == 0) s->next_id = 1;
     if (s->next_txn_id == 0) s->next_txn_id = 1;
@@ -3700,6 +3970,65 @@ bool index_create(Store *s, const char *cls, const char *field) {
 }
 bool index_drop(Store *s, const char *cls, const char *field) {
     LOCK_W(s); bool r = index_drop_unlocked(s, cls, field); UNLOCK_W(s); return r;
+}
+
+uint32_t store_version(Store *s)
+{
+    if (!s) return 0;
+    LOCK_R(s);
+    uint32_t v = s->version;
+    UNLOCK_R(s);
+    return v;
+}
+
+typedef struct {
+    change_fn cb;
+    void     *userdata;
+    size_t    visited;
+} scs_state;
+
+static bool scs_emit(void *ud, uint32_t version, uint32_t object_id,
+                     bool is_create, const char *class_name)
+{
+    scs_state *st = ud;
+    PogChange ch = { version, object_id, is_create, class_name };
+    st->visited++;
+    return st->cb(&ch, st->userdata);
+}
+
+size_t store_changes_since(Store *s, uint32_t since_version,
+                           change_fn cb, void *userdata)
+{
+    if (!s || !cb) return 0;
+    if (!s->path) return 0;   /* ephemeral: nothing tracked */
+
+    /* Snapshot-then-release, matching query_class/index_lookup/
+     * find_by_field's convention: never invoke a caller-supplied callback
+     * while holding the store lock. Brief LOCK_R only to capture the
+     * current version as an upper bound; safe lock-free afterward because
+     * vlog_write_record's fflush+fsync (and s->version's bump) happen
+     * under the writer's wrlock, which the rwlock's mutual exclusion
+     * guarantees happened-before our rdlock observes s->version here. */
+    LOCK_R(s);
+    uint32_t upper = s->version;
+    UNLOCK_R(s);
+
+    if (since_version >= upper) return 0;
+
+    char *vp = path_append(s->path, ".vlog");
+    if (!vp) return 0;
+    FILE *f = fopen(vp, "rb");
+    free(vp);
+    if (!f) return 0;
+
+    scs_state st = { cb, userdata, 0 };
+    uint32_t max_version; long good_end; bool header_ok;
+    vlog_scan(f, since_version, upper, scs_emit, &st,
+              &max_version, &good_end, &header_ok);
+    fclose(f);
+    if (!header_ok)
+        fprintf(stderr, "pog: version log header unreadable in store_changes_since\n");
+    return st.visited;
 }
 
 /* ============================================================

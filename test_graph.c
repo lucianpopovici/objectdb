@@ -26,6 +26,7 @@ static void rm_both(const char *path)
     unlink(path);
     char wal[256]; snprintf(wal, sizeof(wal), "%s.wal", path); unlink(wal);
     char tmp[256]; snprintf(tmp, sizeof(tmp), "%s.tmp", path); unlink(tmp);
+    char vlog[256]; snprintf(vlog, sizeof(vlog), "%s.vlog", path); unlink(vlog);
 }
 
 /* =======================================================
@@ -2152,6 +2153,368 @@ static void test_dns_end_to_end_lookup(void)
 }
 
 /* =======================================================
+ * Phase 14: Version change log (Tier 3b, IXFR-style diffing)
+ * ======================================================= */
+
+/* Probe for a specific object id among the change entries visited.
+ * class_name is copied out (strdup'd) since PogChange.class_name is only
+ * borrowed for the duration of the callback -- caller must free() it. */
+typedef struct {
+    uint32_t target_id;
+    bool     found;
+    bool     is_create;
+    char    *class_name;
+    uint32_t version;
+    int      count;
+} vlog_probe;
+
+static bool vlog_probe_cb(const PogChange *ch, void *ud)
+{
+    vlog_probe *p = ud;
+    if (ch->object_id == p->target_id) {
+        p->found = true;
+        p->is_create = ch->is_create;
+        free(p->class_name);
+        p->class_name = strdup(ch->class_name ? ch->class_name : "");
+        p->version = ch->version;
+        p->count++;
+    }
+    return true;
+}
+
+typedef struct { int limit; int hits; } vlog_stop_ud;
+static bool vlog_stop_cb(const PogChange *ch, void *ud)
+{
+    (void)ch;
+    vlog_stop_ud *u = ud;
+    u->hits++;
+    return u->hits < u->limit;
+}
+
+typedef struct { uint32_t *versions; size_t count, cap; } vlog_seq;
+static bool vlog_seq_cb(const PogChange *ch, void *ud)
+{
+    vlog_seq *s = ud;
+    if (s->count < s->cap) s->versions[s->count] = ch->version;
+    s->count++;
+    return true;
+}
+
+static bool vlog_reentrant_cb(const PogChange *ch, void *ud)
+{
+    Store *s = ud;
+    (void)ch;
+    /* Call back into the store from inside the change_fn -- must not
+     * deadlock. This is exactly the nested-rdlock hazard class already
+     * fixed once in find_by_field; store_changes_since's design releases
+     * its lock before invoking any callback specifically to avoid it. */
+    (void)class_size(s, "Widget");
+    return true;
+}
+
+static void test_vlog_version_starts_zero(void)
+{
+    SECTION("vlog: version starts at 0 for a fresh persistent store");
+    const char *p = "/tmp/pog_vlog_zero.bin";
+    rm_both(p);
+    Store *s = store_open(p);
+    CHECK(s != NULL);
+    CHECK(store_version(s) == 0);
+    store_close(s);
+    rm_both(p);
+}
+
+static void test_vlog_version_bumps(void)
+{
+    SECTION("vlog: version bumps once per committed transaction");
+    const char *p = "/tmp/pog_vlog_bump.bin";
+    rm_both(p);
+    Store *s = store_open(p);
+    CHECK(store_version(s) == 0);
+
+    Object *a = new_object(s);              /* autocommit txn #1 */
+    CHECK(store_version(s) == 1);
+
+    Object *v1 = new_int(s, 1);             /* autocommit txn #2 */
+    CHECK(store_version(s) == 2);
+    set_field(a, "x", v1);                  /* autocommit txn #3 */
+    CHECK(store_version(s) == 3);
+
+    /* explicit multi-op txn: several mutations, one commit, one bump */
+    txn_begin(s);
+    Object *v2 = new_int(s, 2);
+    set_field(a, "y", v2);
+    Object *v3 = new_int(s, 3);
+    set_field(a, "z", v3);
+    txn_commit(s);
+    CHECK(store_version(s) == 4);
+
+    store_close(s);
+    rm_both(p);
+}
+
+static void test_vlog_dedup_within_txn(void)
+{
+    SECTION("vlog: multiple mutations of one object in one txn dedup to one entry");
+    const char *p = "/tmp/pog_vlog_dedup.bin";
+    rm_both(p);
+    Store *s = store_open(p);
+    Object *a = new_object(s);
+    uint32_t v_before = store_version(s);
+
+    txn_begin(s);
+    set_field(a, "x", new_int(s, 1));
+    set_field(a, "y", new_int(s, 2));
+    set_field(a, "z", new_int(s, 3));
+    txn_commit(s);
+
+    CHECK(store_version(s) == v_before + 1);
+
+    vlog_probe probe = {0};
+    probe.target_id = a->id;
+    store_changes_since(s, v_before, vlog_probe_cb, &probe);
+    CHECK(probe.found);
+    CHECK(probe.count == 1);
+    CHECK(probe.version == v_before + 1);
+    free(probe.class_name);
+    store_destroy(s);
+}
+
+static void test_vlog_is_create_flag(void)
+{
+    SECTION("vlog: is_create true for create, false for mutate-only");
+    const char *p = "/tmp/pog_vlog_create.bin";
+    rm_both(p);
+    Store *s = store_open(p);
+    uint32_t v_before = store_version(s);
+
+    txn_begin(s);
+    Object *a = new_object(s);
+    set_field(a, "x", new_int(s, 1));
+    txn_commit(s);
+
+    vlog_probe pa = {0};
+    pa.target_id = a->id;
+    store_changes_since(s, v_before, vlog_probe_cb, &pa);
+    CHECK(pa.found);
+    CHECK(pa.is_create == true);
+    free(pa.class_name);
+
+    Object *b = new_object(s);
+    uint32_t v_after_b_create = store_version(s);
+    txn_begin(s);
+    set_field(b, "y", new_int(s, 2));
+    txn_commit(s);
+
+    vlog_probe pb = {0};
+    pb.target_id = b->id;
+    store_changes_since(s, v_after_b_create, vlog_probe_cb, &pb);
+    CHECK(pb.found);
+    CHECK(pb.is_create == false);   /* mutate-only, created earlier */
+    free(pb.class_name);
+
+    store_destroy(s);
+}
+
+static void test_vlog_root_only_txn_no_bump(void)
+{
+    SECTION("vlog: bind/unbind-only txn does not bump version");
+    const char *p = "/tmp/pog_vlog_root.bin";
+    rm_both(p);
+    Store *s = store_open(p);
+    Object *a = new_object(s);
+    uint32_t v_before = store_version(s);
+
+    CHECK(bind(s, "ROOT", a));
+    CHECK(store_version(s) == v_before);
+    CHECK(unbind(s, "ROOT"));
+    CHECK(store_version(s) == v_before);
+
+    txn_begin(s);
+    bind(s, "ROOT2", a);
+    unbind(s, "ROOT2");
+    txn_commit(s);
+    CHECK(store_version(s) == v_before);
+
+    store_destroy(s);
+}
+
+static void test_vlog_version_survives_reopen(void)
+{
+    SECTION("vlog: version survives store_close/store_open");
+    const char *p = "/tmp/pog_vlog_reopen.bin";
+    rm_both(p);
+    Store *s = store_open(p);
+    new_object(s);
+    new_object(s);
+    uint32_t v1 = store_version(s);
+    CHECK(v1 == 2);
+    store_close(s);
+
+    Store *s2 = store_open(p);
+    CHECK(store_version(s2) == v1);
+    new_object(s2);
+    CHECK(store_version(s2) == v1 + 1);
+    store_close(s2);
+    rm_both(p);
+}
+
+static void test_vlog_survives_checkpoint(void)
+{
+    SECTION("vlog: version and history survive store_checkpoint");
+    const char *p = "/tmp/pog_vlog_checkpoint.bin";
+    rm_both(p);
+    Store *s = store_open(p);
+    Object *a = new_object(s);
+    uint32_t a_id = a->id;
+    uint32_t v_before_ckpt = store_version(s);
+
+    CHECK(store_checkpoint(s));
+    CHECK(store_version(s) == v_before_ckpt);   /* unchanged by checkpoint */
+
+    new_object(s);
+    uint32_t v_after = store_version(s);
+    CHECK(v_after == v_before_ckpt + 1);
+    store_close(s);
+
+    /* reopen: version must reflect ALL history, pre- and post-checkpoint */
+    Store *s2 = store_open(p);
+    CHECK(store_version(s2) == v_after);
+
+    /* pre-checkpoint history must still be visible even though checkpoint
+     * wiped the WAL that history would otherwise have depended on */
+    vlog_probe probe = {0};
+    probe.target_id = a_id;
+    store_changes_since(s2, 0, vlog_probe_cb, &probe);
+    CHECK(probe.found);
+    CHECK(probe.is_create == true);
+    free(probe.class_name);
+
+    store_close(s2);
+    rm_both(p);
+}
+
+static void test_vlog_changes_since_ordering(void)
+{
+    SECTION("vlog: store_changes_since returns entries oldest-first");
+    const char *p = "/tmp/pog_vlog_order.bin";
+    rm_both(p);
+    Store *s = store_open(p);
+    Object *a = new_object(s); set_class(a, "RRset");
+    uint32_t va = store_version(s);
+    new_object(s);
+    new_object(s);
+
+    uint32_t vbuf[16] = {0};
+    vlog_seq sq = { vbuf, 0, 16 };
+    size_t visited = store_changes_since(s, 0, vlog_seq_cb, &sq);
+    CHECK(visited == sq.count);
+    CHECK(sq.count >= 3);
+    for (size_t i = 1; i < sq.count && i < 16; i++)
+        CHECK(vbuf[i - 1] <= vbuf[i]);
+
+    vlog_probe probe = {0};
+    probe.target_id = a->id;
+    store_changes_since(s, 0, vlog_probe_cb, &probe);
+    CHECK(probe.found);
+    CHECK(probe.version == va);
+    CHECK(strcmp(probe.class_name, "RRset") == 0);
+    free(probe.class_name);
+
+    store_destroy(s);
+}
+
+static void test_vlog_early_stop(void)
+{
+    SECTION("vlog: store_changes_since early-stop convention");
+    const char *p = "/tmp/pog_vlog_stop.bin";
+    rm_both(p);
+    Store *s = store_open(p);
+    new_object(s);
+    new_object(s);
+    new_object(s);
+    new_object(s);
+
+    vlog_stop_ud su = { 2, 0 };
+    size_t visited = store_changes_since(s, 0, vlog_stop_cb, &su);
+    CHECK(visited == 2);
+    CHECK(su.hits == 2);
+
+    store_destroy(s);
+}
+
+static void test_vlog_ephemeral_always_zero(void)
+{
+    SECTION("vlog: ephemeral store always reports version 0, no changes");
+    Store *s = store_create();
+    new_object(s);
+    new_object(s);
+    CHECK(store_version(s) == 0);
+
+    vlog_stop_ud su = { 100, 0 };
+    size_t visited = store_changes_since(s, 0, vlog_stop_cb, &su);
+    CHECK(visited == 0);
+
+    store_destroy(s);
+}
+
+static void test_vlog_callback_reentrancy_no_deadlock(void)
+{
+    SECTION("vlog: change_fn may safely call back into the store (no deadlock)");
+    const char *p = "/tmp/pog_vlog_reentrant.bin";
+    rm_both(p);
+    Store *s = store_open(p);
+    Object *a = new_object(s);
+    set_class(a, "Widget");
+    bind(s, "W", a);
+
+    size_t visited = store_changes_since(s, 0, vlog_reentrant_cb, s);
+    CHECK(visited >= 1);
+
+    store_close(s);
+    rm_both(p);
+}
+
+static void test_vlog_torn_tail_recovery(void)
+{
+    SECTION("vlog: torn tail in .vlog is discarded, earlier history survives");
+    const char *p = "/tmp/pog_vlog_torn.bin";
+    rm_both(p);
+
+    Store *s = store_open(p);
+    Object *a = new_object(s);
+    set_class(a, "Widget");
+    uint32_t v_clean = store_version(s);
+    uint32_t a_id = a->id;
+    store_close(s);   /* cleanly flushes and fsyncs */
+
+    /* simulate a crash mid-write of the next vlog record: a record header
+     * (version=5, entry_count=2) with no entry data following it */
+    char vlog[256]; snprintf(vlog, sizeof(vlog), "%s.vlog", p);
+    FILE *vf = fopen(vlog, "ab");
+    CHECK(vf != NULL);
+    uint8_t garbage[] = { 0x05, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00 };
+    fwrite(garbage, 1, sizeof(garbage), vf);
+    fclose(vf);
+
+    Store *s2 = store_open(p);
+    CHECK(s2 != NULL);
+    CHECK(store_version(s2) == v_clean);   /* torn record discarded */
+
+    vlog_probe probe = {0};
+    probe.target_id = a_id;
+    store_changes_since(s2, 0, vlog_probe_cb, &probe);
+    CHECK(probe.found);
+    free(probe.class_name);
+
+    /* a fresh commit should append cleanly after the truncated point */
+    new_object(s2);
+    CHECK(store_version(s2) == v_clean + 1);
+    store_close(s2);
+    rm_both(p);
+}
+
+/* =======================================================
  * Phase 12: Process + thread concurrency
  * ======================================================= */
 
@@ -2389,6 +2752,19 @@ int main(void)
     test_dns_vlist_persist_save_load();
     test_dns_vlist_persist_wal();
     test_dns_end_to_end_lookup();
+
+    test_vlog_version_starts_zero();
+    test_vlog_version_bumps();
+    test_vlog_dedup_within_txn();
+    test_vlog_is_create_flag();
+    test_vlog_root_only_txn_no_bump();
+    test_vlog_version_survives_reopen();
+    test_vlog_survives_checkpoint();
+    test_vlog_changes_since_ordering();
+    test_vlog_early_stop();
+    test_vlog_ephemeral_always_zero();
+    test_vlog_callback_reentrancy_no_deadlock();
+    test_vlog_torn_tail_recovery();
 
     test_process_lock();
     test_concurrent_readers_one_writer();

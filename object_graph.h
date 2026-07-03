@@ -142,9 +142,19 @@ struct Store {
     /* persistence */
     char     *path;         /* NULL = ephemeral */
     FILE     *wal_fp;       /* open for append when persistent */
+    FILE     *vlog_fp;      /* open for append when persistent; durable
+                              * per-txn change log backing store_version()/
+                              * store_changes_since(). Unlike wal_fp, NEVER
+                              * truncated by store_checkpoint -- kept
+                              * forever by design. NULL for ephemeral stores. */
     int       lock_fd;      /* fd used for fcntl advisory lock; -1 if none */
     uint32_t  seq;          /* snapshot generation */
     uint32_t  next_txn_id;
+    uint32_t  version;      /* current change-log version. 0 if no committed
+                              * txn has touched an object yet, or ephemeral.
+                              * Independent of next_txn_id/seq -- see
+                              * store_version()'s doc comment for why those
+                              * can't be reused for this. */
 
     /* active transaction (NULL = autocommit / none) */
     Txn      *active_txn;
@@ -353,5 +363,65 @@ size_t  index_lookup(Store *s, const char *cls, const char *field,
  * declared index; does not fall back to scanning. */
 Object *index_lookup_one(Store *s, const char *cls, const char *field,
                          const char *value);
+
+/* ============================================================
+ * Version change log (IXFR-style diffing)
+ *
+ * Persistent stores only. Every committed transaction (both explicit
+ * txn_begin()/txn_commit() and autocommit's implicit single-op
+ * transactions) that touches at least one object bumps a monotonically
+ * increasing version counter and durably appends one change-log record
+ * (one deduplicated entry per distinct object touched) to a dedicated
+ * <path>.vlog file. Ephemeral stores never track this: store_version()
+ * always returns 0 and store_changes_since() always returns 0 for them.
+ *
+ * This is diff/audit history only -- there is no point-in-time openable
+ * Store, and history is never pruned. It survives store_checkpoint(),
+ * which only folds the WAL into the snapshot and resets the WAL --
+ * .vlog is a wholly separate artifact, never touched by checkpoint.
+ * ============================================================ */
+
+/* Current version: incremented once per committed transaction that
+ * touched at least one object, on a persistent store only. 0 for an
+ * ephemeral store or a persistent store with no such commits yet.
+ * Survives store_open()/store_checkpoint() -- unlike the class/hash
+ * indexes, this is durable append-only history, not derived state
+ * rebuilt from current object state, so it is NOT reset by checkpoint.
+ *
+ * (Why not reuse next_txn_id or seq? next_txn_id increments per
+ * txn_begin but is not persisted in the snapshot header written by
+ * save() -- after a checkpoint truncates the WAL it depends on for
+ * recovery, a restart would silently reset it, causing version reuse.
+ * seq is a snapshot generation counter bumped only at checkpoint,
+ * unrelated to per-transaction granularity. Neither is safe for this
+ * purpose, hence the dedicated `version` counter and `.vlog` file.) */
+uint32_t store_version(Store *s);
+
+/* One change-log entry: an object created or mutated by the transaction
+ * that produced `version`. class_name reflects that object's class AT
+ * COMMIT TIME (it may have since changed class or been reclaimed by GC
+ * -- this is a diff/audit log, not a point-in-time store). class_name is
+ * "" if the object was not a tagged composite at that time, and is
+ * borrowed/valid only for the duration of the change_fn call it's
+ * passed to. */
+typedef struct {
+    uint32_t    version;
+    uint32_t    object_id;
+    bool        is_create;
+    const char *class_name;
+} PogChange;
+
+typedef bool (*change_fn)(const PogChange *change, void *userdata);
+
+/* Invoke cb once per change-log entry with version > since_version,
+ * oldest first. Persistent stores only -- always returns 0 for an
+ * ephemeral store. Takes the store's read lock only briefly to capture
+ * the current version as an upper bound; the file scan and every
+ * change_fn call then run lock-free, so cb may safely read the store
+ * (e.g. class_of() on object_id) without risking a nested-rdlock
+ * deadlock. Returns entries visited; false from cb stops early, same
+ * convention as query_class. */
+size_t store_changes_since(Store *s, uint32_t since_version,
+                           change_fn cb, void *userdata);
 
 #endif /* OBJECT_GRAPH_H */
