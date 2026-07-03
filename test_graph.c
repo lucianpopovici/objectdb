@@ -44,6 +44,26 @@ static void test_primitives(void)
     store_destroy(s);
 }
 
+static void test_bytes_primitives(void)
+{
+    SECTION("bytes primitives (embedded NUL)");
+    Store *s = store_create();
+    uint8_t raw[] = { 0xDE, 0xAD, 0x00, 0xBE, 0xEF };  /* embedded zero */
+    Object *b = new_bytes(s, raw, sizeof(raw));
+    CHECK(b->kind == OBJ_BYTES);
+    CHECK(bytes_len(b) == sizeof(raw));
+    CHECK(memcmp(bytes_data(b), raw, sizeof(raw)) == 0);
+    /* direct field access, since this engine has no opaque types */
+    CHECK(b->bytes.len == sizeof(raw));
+    CHECK(memcmp(b->bytes.data, raw, sizeof(raw)) == 0);
+
+    Object *empty = new_bytes(s, NULL, 0);
+    CHECK(empty->kind == OBJ_BYTES);
+    CHECK(bytes_len(empty) == 0);
+    CHECK(bytes_data(empty) != NULL);   /* never NULL, even for len==0 */
+    store_destroy(s);
+}
+
 static void test_composite_fields(void)
 {
     SECTION("composite fields");
@@ -285,6 +305,25 @@ static void test_txn_abort_primitives(void)
     store_destroy(s);
 }
 
+static void test_bytes_txn_abort(void)
+{
+    SECTION("txn: abort restores bytes values (WOP_SET_BYTES undo path)");
+    Store *s = store_create();
+    uint8_t before[] = { 0x01, 0x00, 0x02 };
+    uint8_t after[]  = { 0xFF, 0xFF };
+    Object *b = new_bytes(s, before, sizeof(before));
+
+    txn_begin(s);
+    set_bytes(b, after, sizeof(after));
+    CHECK(bytes_len(b) == sizeof(after));
+    CHECK(memcmp(bytes_data(b), after, sizeof(after)) == 0);
+    txn_abort(s);
+
+    CHECK(bytes_len(b) == sizeof(before));
+    CHECK(memcmp(bytes_data(b), before, sizeof(before)) == 0);
+    store_destroy(s);
+}
+
 static void test_txn_abort_lists(void)
 {
     SECTION("txn: abort reverses list ops");
@@ -368,6 +407,41 @@ static void test_snapshot_roundtrip(void)
     unlink(p);
 }
 
+static void test_bytes_snapshot_roundtrip(void)
+{
+    SECTION("save/load roundtrip: bytes with embedded NUL");
+    const char *p = "/tmp/pog_bytes_snap.bin";
+    unlink(p);
+
+    Store *s = store_create();
+    Object *root = new_object(s);
+    uint8_t payload[] = { 0x00, 0x01, 0x00, 0x00, 0xFF, 0x00 };
+    Object *bf = new_bytes(s, payload, sizeof(payload));
+    set_field(root, "blob", bf);
+    Object *items = new_list(s);
+    list_append(items, new_bytes(s, "\x00\x00\x00", 3));
+    set_field(root, "items", items);
+    bind(s, "ROOT", root);
+    CHECK(save(s, p));
+    store_destroy(s);
+
+    Store *s2 = load(p);
+    CHECK(s2 != NULL);
+    Object *r = get(s2, "ROOT");
+    CHECK(r != NULL);
+    Object *b2 = get_field(r, "blob");
+    CHECK(b2 != NULL && b2->kind == OBJ_BYTES);
+    CHECK(bytes_len(b2) == sizeof(payload));
+    CHECK(memcmp(bytes_data(b2), payload, sizeof(payload)) == 0);
+    Object *l2 = get_field(r, "items");
+    CHECK(list_len(l2) == 1);
+    Object *lb = list_get(l2, 0);
+    CHECK(lb->kind == OBJ_BYTES && bytes_len(lb) == 3);
+    CHECK(memcmp(bytes_data(lb), "\x00\x00\x00", 3) == 0);
+    store_destroy(s2);
+    unlink(p);
+}
+
 /* =======================================================
  * Phase 8: Persistent stores + WAL recovery
  * ======================================================= */
@@ -418,6 +492,31 @@ static void test_persistent_explicit_txn(void)
     CHECK(list_get(l2, 0)->int_value == 100);
     CHECK(list_get(l2, 1)->int_value == 200);
     CHECK(list_get(l2, 2)->int_value == 300);
+    store_close(s2);
+    rm_both(p);
+}
+
+static void test_persistent_explicit_txn_bytes(void)
+{
+    SECTION("persistent: explicit txn with bytes ops survives reopen");
+    const char *p = "/tmp/pog_txn_bytes.bin";
+    rm_both(p);
+
+    Store *s = store_open(p);
+    txn_begin(s);
+    uint8_t v1[] = { 0x00, 0xAA };
+    uint8_t v2[] = { 0xBB, 0x00, 0xCC };
+    Object *bf = new_bytes(s, v1, sizeof(v1));
+    set_bytes(bf, v2, sizeof(v2));
+    bind(s, "BLOB", bf);
+    CHECK(txn_commit(s));
+    store_close(s);
+
+    Store *s2 = store_open(p);
+    Object *bf2 = get(s2, "BLOB");
+    CHECK(bf2 != NULL && bf2->kind == OBJ_BYTES);
+    CHECK(bytes_len(bf2) == sizeof(v2));
+    CHECK(memcmp(bytes_data(bf2), v2, sizeof(v2)) == 0);
     store_close(s2);
     rm_both(p);
 }
@@ -552,6 +651,41 @@ static void test_torn_wal_tail(void)
     rm_both(p);
 }
 
+static void test_bytes_torn_wal_tail(void)
+{
+    SECTION("recovery: torn WAL tail after bytes ops is discarded");
+    const char *p = "/tmp/pog_bytes_torn.bin";
+    rm_both(p);
+
+    Store *s = store_open(p);
+    uint8_t v1[] = { 0x00, 0x11, 0x00 };
+    uint8_t v2[] = { 0x22, 0x00, 0x33 };
+    Object *r = new_object(s);
+    Object *bf = new_bytes(s, v1, sizeof(v1));       /* WOP_NEW_BYTES */
+    set_field(r, "blob", bf);
+    set_bytes(bf, v2, sizeof(v2));                    /* WOP_SET_BYTES */
+    bind(s, "R", r);
+    store_close(s);   /* cleanly flushes and fsyncs */
+
+    char wal[256]; snprintf(wal, sizeof(wal), "%s.wal", p);
+    FILE *wf = fopen(wal, "ab");
+    CHECK(wf != NULL);
+    uint8_t garbage[] = { 1, 0xAB, 0xCD };  /* WOP_TXN_BEGIN then short */
+    fwrite(garbage, 1, sizeof(garbage), wf);
+    fclose(wf);
+
+    Store *s2 = store_open(p);
+    CHECK(s2 != NULL);
+    Object *r2 = get(s2, "R");
+    CHECK(r2 != NULL);
+    Object *bf2 = get_field(r2, "blob");
+    CHECK(bf2 != NULL && bf2->kind == OBJ_BYTES);
+    CHECK(bytes_len(bf2) == sizeof(v2));
+    CHECK(memcmp(bytes_data(bf2), v2, sizeof(v2)) == 0);
+    store_close(s2);
+    rm_both(p);
+}
+
 static void test_persistent_complex_graph(void)
 {
     SECTION("persistent: complex graph with shared refs + lists");
@@ -585,6 +719,50 @@ static void test_persistent_complex_graph(void)
         CHECK(get_field(list_get(ul, i), "shared") == first_shared);
     }
     CHECK(get_field(first_shared, "value")->int_value == 999);
+    store_close(s2);
+    rm_both(p);
+}
+
+static void test_persistent_complex_graph_bytes(void)
+{
+    SECTION("persistent: complex graph with shared bytes refs + embedded NULs");
+    const char *p = "/tmp/pog_complex_bytes.bin";
+    rm_both(p);
+
+    Store *s = store_open(p);
+    uint8_t shared_val[] = { 0x00, 0x99, 0x00, 0x99 };
+    Object *shared = new_object(s);
+    set_field(shared, "value", new_bytes(s, shared_val, sizeof(shared_val)));
+
+    Object *users = new_list(s);
+    for (int i = 0; i < 5; i++) {
+        Object *u = new_object(s);
+        uint8_t tag[4] = { (uint8_t)i, 0x00, 0x00, (uint8_t)(i * 2) };
+        set_field(u, "tag", new_bytes(s, tag, sizeof(tag)));
+        set_field(u, "shared", shared);
+        list_append(users, u);
+    }
+    bind(s, "USERS", users);
+    store_close(s);
+
+    Store *s2 = store_open(p);
+    Object *ul = get(s2, "USERS");
+    CHECK(ul != NULL);
+    CHECK(list_len(ul) == 5);
+
+    Object *first_shared = get_field(list_get(ul, 0), "shared");
+    for (size_t i = 1; i < list_len(ul); i++)
+        CHECK(get_field(list_get(ul, i), "shared") == first_shared);
+    CHECK(bytes_len(get_field(first_shared, "value")) == sizeof(shared_val));
+    CHECK(memcmp(bytes_data(get_field(first_shared, "value")),
+                 shared_val, sizeof(shared_val)) == 0);
+
+    for (size_t i = 0; i < list_len(ul); i++) {
+        Object *tagobj = get_field(list_get(ul, i), "tag");
+        CHECK(tagobj->kind == OBJ_BYTES && bytes_len(tagobj) == 4);
+        CHECK(bytes_data(tagobj)[0] == (uint8_t)i);
+        CHECK(bytes_data(tagobj)[1] == 0x00);
+    }
     store_close(s2);
     rm_both(p);
 }
@@ -1705,6 +1883,27 @@ static void test_index_non_string_field_excluded(void)
     store_destroy(s);
 }
 
+static void test_index_bytes_field_excluded(void)
+{
+    SECTION("index: OBJ_BYTES field values are silently excluded");
+    Store *s = store_create();
+    uint8_t raw[] = { 0x33, 0x00 };
+    Object *a = new_object(s); set_class(a, "User");
+    set_field(a, "id", new_bytes(s, raw, sizeof(raw)));
+    Object *b = new_object(s); set_class(b, "User");
+    set_field(b, "id", new_string(s, "33"));
+
+    CHECK(index_create(s, "User", "id"));
+    CHECK(index_lookup_one(s, "User", "id", "33") == b);
+
+    Object *found[4] = {0};
+    obj_collect oc = { found, 0, 4 };
+    size_t visited = index_lookup(s, "User", "id", "33", collect_cb, &oc);
+    CHECK(visited == 1);
+    CHECK(found[0] == b);
+    store_destroy(s);
+}
+
 static void test_index_rehash_correctness(void)
 {
     SECTION("index: rehash correctness under load (~50 distinct values)");
@@ -2098,6 +2297,7 @@ static void test_concurrent_writers_serialize(void)
 int main(void)
 {
     test_primitives();
+    test_bytes_primitives();
     test_composite_fields();
     test_pointer_semantics();
     test_nested_and_shared();
@@ -2114,18 +2314,23 @@ int main(void)
     test_txn_commit_inmem();
     test_txn_abort_fields();
     test_txn_abort_primitives();
+    test_bytes_txn_abort();
     test_txn_abort_lists();
     test_txn_abort_roots();
 
     test_snapshot_roundtrip();
+    test_bytes_snapshot_roundtrip();
 
     test_persistent_autocommit();
     test_persistent_explicit_txn();
+    test_persistent_explicit_txn_bytes();
     test_persistent_abort_not_persisted();
     test_checkpoint();
     test_multiple_reopens();
     test_torn_wal_tail();
+    test_bytes_torn_wal_tail();
     test_persistent_complex_graph();
+    test_persistent_complex_graph_bytes();
 
     test_vlist_cidr_all_basic();
     test_vlist_cidr_all_edge_sizes();
@@ -2171,6 +2376,7 @@ int main(void)
     test_index_find_by_field_equivalence();
     test_index_create_mid_txn_abort();
     test_index_non_string_field_excluded();
+    test_index_bytes_field_excluded();
     test_index_rehash_correctness();
 
     test_dns_ancestors_multilabel();

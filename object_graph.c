@@ -24,7 +24,7 @@
 #define INITIAL_LOG_CAP    32
 
 #define POGE_MAGIC   0x45474F50u   /* "POGE" */
-#define POGE_VERSION 3u            /* v3: adds class_name per composite */
+#define POGE_VERSION 4u            /* v4: adds OBJ_BYTES value type */
 
 #define POGW_MAGIC   0x57474F50u   /* "POGW" */
 #define POGW_VERSION 1u
@@ -38,10 +38,12 @@ enum {
     WOP_NEW_STRING  = 12,
     WOP_NEW_LIST    = 13,
     WOP_NEW_VLIST   = 14,
+    WOP_NEW_BYTES   = 15,
 
     WOP_SET_INT     = 20,
     WOP_SET_STR     = 21,
     WOP_SET_FIELD   = 22,
+    WOP_SET_BYTES   = 23,
 
     WOP_LIST_APPEND = 30,
     WOP_LIST_SET    = 31,
@@ -68,10 +70,14 @@ typedef struct {
     Object  *new_ref;
     int64_t  new_int;
     char    *new_str;                /* owned */
+    uint8_t *new_bytes;               /* owned */
+    size_t   new_bytes_len;
 
     Object  *old_ref;
     int64_t  old_int;
     char    *old_str;                /* owned */
+    uint8_t *old_bytes;               /* owned */
+    size_t   old_bytes_len;
     bool     had_prev;
     bool     is_create;
 } TxnRec;
@@ -92,6 +98,8 @@ static void txnrec_free_owned(TxnRec *r)
 {
     free(r->new_str); r->new_str = NULL;
     free(r->old_str); r->old_str = NULL;
+    free(r->new_bytes); r->new_bytes = NULL;
+    free(r->old_bytes); r->old_bytes = NULL;
 }
 
 /* ============================================================
@@ -178,6 +186,7 @@ static void free_transient(Object *o)
 {
     if (!o) return;
     if (o->kind == OBJ_STRING)         free(o->str_value);
+    else if (o->kind == OBJ_BYTES)     free(o->bytes.data);
     else if (o->kind == OBJ_COMPOSITE) free(o->composite.items);
     else if (o->kind == OBJ_LIST)      free(o->list.items);
     free(o);
@@ -383,6 +392,7 @@ static void free_object(Object *o)
     if (!o) return;
     free(o->class_name);
     if (o->kind == OBJ_STRING)         free(o->str_value);
+    else if (o->kind == OBJ_BYTES)     free(o->bytes.data);
     else if (o->kind == OBJ_COMPOSITE) free(o->composite.items);
     else if (o->kind == OBJ_LIST)      free(o->list.items);
     else if (o->kind == OBJ_VLIST) {
@@ -963,6 +973,41 @@ static Object *new_string_unlocked(Store *s, const char *v)
     return o;
 }
 
+/* malloc+memcpy duplicate of a byte buffer, analogous to strdup() for
+ * OBJ_STRING. Never returns NULL for len==0 (allocates a 1-byte sentinel,
+ * so bytes.data is never NULL for a live OBJ_BYTES object). NULL only on
+ * allocation failure. */
+static uint8_t *bytes_dup(const void *data, size_t len)
+{
+    uint8_t *b = malloc(len ? len : 1);
+    if (!b) return NULL;
+    if (len) memcpy(b, data, len);
+    return b;
+}
+
+static Object *new_bytes_unlocked(Store *s, const void *data, size_t len)
+{
+    if (!s) return NULL;
+    bool started;
+    if (!auto_begin(s, &started)) return NULL;
+    Object *o = alloc_object(s, OBJ_BYTES);
+    if (!o) { auto_end(s, started, false); return NULL; }
+    o->bytes.data = bytes_dup(data, len);
+    if (!o->bytes.data) { auto_end(s, started, false); return NULL; }
+    o->bytes.len = len;
+
+    TxnRec r = {0};
+    r.op = WOP_NEW_BYTES; r.target = o; r.target_id = o->id;
+    r.new_bytes = bytes_dup(data, len);
+    if (!r.new_bytes) { auto_end(s, started, false); return NULL; }
+    r.new_bytes_len = len;
+    r.is_create = true;
+    log_push(s, r);
+
+    if (!auto_end(s, started, true)) return NULL;
+    return o;
+}
+
 static Object *new_list_unlocked(Store *s)
 {
     if (!s) return NULL;
@@ -1041,6 +1086,40 @@ static bool set_str_unlocked(Object *o, const char *v)
     r.op = WOP_SET_STR; r.target = o; r.target_id = o->id;
     r.new_str = strdup(v ? v : "");
     r.old_str = old; r.had_prev = true;        /* take ownership of old */
+    log_push(s, r);
+
+    return auto_end(s, started, true);
+}
+
+static bool set_bytes_unlocked(Object *o, const void *data, size_t len)
+{
+    if (!o || o->kind != OBJ_BYTES) return false;
+    Store *s = o->store;
+    bool started;
+    if (!auto_begin(s, &started)) return false;
+
+    uint8_t *new_data = bytes_dup(data, len);
+    if (!new_data) { auto_end(s, started, false); return false; }
+
+    /* Capture old pointer/len BEFORE reassigning; ownership transfers to
+     * r.old_bytes, never dereferenced again through these locals — avoids
+     * the borrowed-pointer-after-free shape found in set_class_unlocked_impl. */
+    uint8_t *old_data = o->bytes.data;
+    size_t   old_len  = o->bytes.len;
+    o->bytes.data = new_data;
+    o->bytes.len  = len;
+
+    TxnRec r = {0};
+    r.op = WOP_SET_BYTES; r.target = o; r.target_id = o->id;
+    r.new_bytes = bytes_dup(data, len);
+    if (!r.new_bytes) {
+        o->bytes.data = old_data; o->bytes.len = old_len;   /* roll back */
+        free(new_data);
+        auto_end(s, started, false);
+        return false;
+    }
+    r.new_bytes_len = len;
+    r.old_bytes = old_data; r.old_bytes_len = old_len; r.had_prev = true;
     log_push(s, r);
 
     return auto_end(s, started, true);
@@ -1316,6 +1395,7 @@ static void pset_add(PtrSet *p, Object *o)
  * crafted/deep snapshot), so recursion depth must be bounded the same way
  * mark_from() bounds it via an explicit worklist. */
 #define DUMP_MAX_DEPTH 1000
+#define POG_DUMP_BYTES_HEX_CAP 8   /* max bytes rendered as hex before "..." */
 
 static void dump_rec(Object *o, PtrSet *v, int depth)
 {
@@ -1327,6 +1407,16 @@ static void dump_rec(Object *o, PtrSet *v, int depth)
     switch (o->kind) {
     case OBJ_INT:    printf("%lld", (long long)o->int_value);         break;
     case OBJ_STRING: printf("\"%s\"", o->str_value ? o->str_value : ""); break;
+    case OBJ_BYTES: {
+        size_t cap = o->bytes.len < POG_DUMP_BYTES_HEX_CAP
+                     ? o->bytes.len : POG_DUMP_BYTES_HEX_CAP;
+        printf("<%zu bytes: ", o->bytes.len);
+        for (size_t i = 0; i < cap; i++)
+            printf("%02x", (unsigned)o->bytes.data[i]);
+        if (o->bytes.len > cap) printf("...");
+        printf(">");
+        break;
+    }
     case OBJ_LIST:
         printf("#%u[", o->id);
         for (size_t i = 0; i < o->list.count; i++) {
@@ -1519,6 +1609,31 @@ static char *r_str(FILE *f)
     return s;
 }
 
+/* Length-prefixed raw-byte I/O, analogous to w_str/r_str but taking an
+ * explicit length instead of deriving it from strlen() — required because
+ * OBJ_BYTES payloads may contain embedded zero bytes. Unlike w_str (which
+ * derives its length from strlen() and would silently truncate at the
+ * first embedded zero), w_bytes fails outright on a length that doesn't
+ * fit in a u32 rather than writing a corrupt/wrapped-length record. */
+static bool w_bytes(FILE *f, const uint8_t *data, size_t len)
+{
+    if (len > UINT32_MAX) return false;
+    uint32_t n = (uint32_t)len;
+    if (!w_u32(f, n)) return false;
+    return n == 0 || fwrite(data, 1, n, f) == n;
+}
+
+static uint8_t *r_bytes(FILE *f, size_t *out_len)
+{
+    uint32_t len;
+    if (!r_u32(f, &len) || len > (1u << 24)) return NULL;
+    uint8_t *b = malloc(len ? len : 1);
+    if (!b) return NULL;
+    if (len && fread(b, 1, len, f) != len) { free(b); return NULL; }
+    *out_len = len;
+    return b;
+}
+
 /* ============================================================
  * Snapshot I/O (save/load)
  * ============================================================ */
@@ -1546,6 +1661,9 @@ bool save(Store *s, const char *path)
             break;
         case OBJ_STRING:
             ok &= w_str(f, o->str_value);
+            break;
+        case OBJ_BYTES:
+            ok &= w_bytes(f, o->bytes.data, o->bytes.len);
             break;
         case OBJ_COMPOSITE:
             ok &= w_str(f, o->class_name ? o->class_name : "");
@@ -1680,6 +1798,13 @@ Store *load(const char *path)
             o->str_value = r_str(f);
             if (!o->str_value) { free_object(o); ok = false; }
             break;
+        case OBJ_BYTES: {
+            size_t blen;
+            o->bytes.data = r_bytes(f, &blen);
+            if (!o->bytes.data) { free_object(o); ok = false; break; }
+            o->bytes.len = blen;
+            break;
+        }
         case OBJ_COMPOSITE: {
             char *cname = r_str(f);
             if (!cname) { free_object(o); ok = false; break; }
@@ -1858,6 +1983,9 @@ static bool wal_write_rec(FILE *f, const TxnRec *r)
     case WOP_NEW_STRING:
     case WOP_SET_STR:
         return w_u32(f, r->target_id) && w_str(f, r->new_str);
+    case WOP_NEW_BYTES:
+    case WOP_SET_BYTES:
+        return w_u32(f, r->target_id) && w_bytes(f, r->new_bytes, r->new_bytes_len);
     case WOP_SET_FIELD:
         return w_u32(f, r->target_id) && w_str(f, r->key) &&
                w_u32(f, r->new_ref ? r->new_ref->id : 0);
@@ -1927,6 +2055,14 @@ static bool wal_apply_pending(Store *s, IdMap *map,
             if (!idmap_put(map, r->target_id, o)) return false;
             break;
         }
+        case WOP_NEW_BYTES: {
+            Object *o = alloc_with_id(s, OBJ_BYTES, r->target_id);
+            if (!o) return false;
+            o->bytes.data = r->new_bytes; r->new_bytes = NULL; /* move */
+            o->bytes.len  = r->new_bytes_len;
+            if (!idmap_put(map, r->target_id, o)) return false;
+            break;
+        }
         case WOP_NEW_LIST: {
             Object *o = alloc_with_id(s, OBJ_LIST, r->target_id);
             if (!o || !idmap_put(map, r->target_id, o)) return false;
@@ -1957,6 +2093,15 @@ static bool wal_apply_pending(Store *s, IdMap *map,
             if (o && o->kind == OBJ_STRING) {
                 free(o->str_value);
                 o->str_value = r->new_str; r->new_str = NULL;
+            }
+            break;
+        }
+        case WOP_SET_BYTES: {
+            Object *o = idmap_get(map, r->target_id);
+            if (o && o->kind == OBJ_BYTES) {
+                free(o->bytes.data);
+                o->bytes.data = r->new_bytes; r->new_bytes = NULL;
+                o->bytes.len  = r->new_bytes_len;
             }
             break;
         }
@@ -2085,6 +2230,11 @@ static bool wal_read_rec(FILE *f, TxnRec *r)
         if (!r_u32(f, &r->target_id)) return false;
         r->new_str = r_str(f);
         return r->new_str != NULL;
+    case WOP_NEW_BYTES:
+    case WOP_SET_BYTES:
+        if (!r_u32(f, &r->target_id)) return false;
+        r->new_bytes = r_bytes(f, &r->new_bytes_len);
+        return r->new_bytes != NULL;
     case WOP_SET_FIELD: {
         if (!r_u32(f, &r->target_id)) return false;
         char *k = r_str(f); uint32_t vid;
@@ -2279,6 +2429,13 @@ static void apply_undo(Store *s, TxnRec *r)
         if (r->target && r->target->kind == OBJ_STRING) {
             free(r->target->str_value);
             r->target->str_value = r->old_str; r->old_str = NULL;
+        }
+        break;
+    case WOP_SET_BYTES:
+        if (r->target && r->target->kind == OBJ_BYTES) {
+            free(r->target->bytes.data);
+            r->target->bytes.data = r->old_bytes; r->old_bytes = NULL;
+            r->target->bytes.len  = r->old_bytes_len;
         }
         break;
     case WOP_SET_FIELD: {
@@ -3251,6 +3408,11 @@ static bool set_class_unlocked_impl(Object *o, const char *new_name)
     return auto_end(s, started, true);
 }
 
+static const uint8_t *bytes_data_unlocked(Object *o)
+{ return (o && o->kind == OBJ_BYTES) ? o->bytes.data : NULL; }
+static size_t bytes_len_unlocked(Object *o)
+{ return (o && o->kind == OBJ_BYTES) ? o->bytes.len : 0; }
+
 static const char *class_of_unlocked(Object *o)
 {
     return (o && o->kind == OBJ_COMPOSITE) ? o->class_name : NULL;
@@ -3291,6 +3453,9 @@ Object *new_int(Store *s, int64_t v) {
 Object *new_string(Store *s, const char *v) {
     LOCK_W(s); Object *r = new_string_unlocked(s, v); UNLOCK_W(s); return r;
 }
+Object *new_bytes(Store *s, const void *data, size_t len) {
+    LOCK_W(s); Object *r = new_bytes_unlocked(s, data, len); UNLOCK_W(s); return r;
+}
 Object *new_list(Store *s) {
     LOCK_W(s); Object *r = new_list_unlocked(s); UNLOCK_W(s); return r;
 }
@@ -3305,6 +3470,10 @@ bool set_int(Object *o, int64_t v) {
 bool set_str(Object *o, const char *v) {
     Store *s = o ? o->store : NULL;
     LOCK_W(s); bool r = set_str_unlocked(o, v); UNLOCK_W(s); return r;
+}
+bool set_bytes(Object *o, const void *data, size_t len) {
+    Store *s = o ? o->store : NULL;
+    LOCK_W(s); bool r = set_bytes_unlocked(o, data, len); UNLOCK_W(s); return r;
 }
 bool set_field(Object *o, const char *k, Object *v) {
     Store *s = o ? o->store : NULL;
@@ -3378,6 +3547,15 @@ const char *class_of(Object *o) {
     const char *r = class_of_unlocked(o);
     UNLOCK_R(s);
     return r;
+}
+
+const uint8_t *bytes_data(Object *o) {
+    Store *s = o ? o->store : NULL;
+    LOCK_R(s); const uint8_t *r = bytes_data_unlocked(o); UNLOCK_R(s); return r;
+}
+size_t bytes_len(Object *o) {
+    Store *s = o ? o->store : NULL;
+    LOCK_R(s); size_t r = bytes_len_unlocked(o); UNLOCK_R(s); return r;
 }
 
 /* ============================================================

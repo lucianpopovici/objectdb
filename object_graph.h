@@ -37,6 +37,7 @@ typedef enum {
     OBJ_STRING    = 2,
     OBJ_LIST      = 3,
     OBJ_VLIST     = 4,       /* virtual (computed) list, read-only */
+    OBJ_BYTES     = 5,       /* binary blob; may contain embedded zero bytes */
 } ObjectKind;
 
 typedef struct Object Object;
@@ -67,6 +68,10 @@ struct Object {
     union {
         int64_t int_value;
         char   *str_value;      /* owned */
+        struct {
+            uint8_t *data;      /* owned; may contain embedded zero bytes */
+            size_t   len;
+        } bytes;
         struct {
             Field  *items;
             size_t  count;
@@ -184,12 +189,22 @@ Object *new_object (Store *s);
 Object *new_int    (Store *s, int64_t     value);
 Object *new_string (Store *s, const char *value);
 Object *new_list   (Store *s);
+Object *new_bytes  (Store *s, const void *data, size_t len);
 
 /* --- Primitive setters (WAL-tracked) ---
- * Prefer these over directly writing to o->int_value / o->str_value;
- * direct writes are not logged and break durability. */
-bool set_int(Object *o, int64_t     v);
-bool set_str(Object *o, const char *v);
+ * Prefer these over directly writing to o->int_value / o->str_value /
+ * o->bytes.{data,len}; direct writes are not logged and break durability. */
+bool set_int  (Object *o, int64_t     v);
+bool set_str  (Object *o, const char *v);
+bool set_bytes(Object *o, const void *data, size_t len);
+
+/* --- Bytes accessors ---
+ * o->bytes.data / o->bytes.len are directly readable per this file's
+ * no-opaque-types convention; these wrap that access with the store's
+ * rdlock, same as class_of()/field_count(). Return NULL/0 if o is NULL or
+ * not OBJ_BYTES. */
+const uint8_t *bytes_data(Object *o);
+size_t         bytes_len (Object *o);
 
 /* --- Composite fields --- */
 bool    set_field (Object *o, const char *key, Object *value);
