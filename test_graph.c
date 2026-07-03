@@ -2807,6 +2807,55 @@ static void test_vlog_torn_tail_recovery(void)
     rm_both(p);
 }
 
+static void test_vlog_no_vlog_flag(void)
+{
+    SECTION("vlog: POG_OPEN_NO_VLOG skips the change log, keeps durability");
+    const char *p = "/tmp/pog_vlog_off.bin";
+    rm_both(p);
+
+    Store *s = store_open_flags(p, POG_OPEN_NO_VLOG);
+    CHECK(s != NULL);
+    Object *a = new_object(s);
+    set_class(a, "Widget");
+    set_field(a, "name", new_string(s, "durable"));
+    uint32_t a_id = a->id;
+
+    /* no version tracking, no change log, no .vlog file */
+    CHECK(store_version(s) == 0);
+    CHECK(store_changes_since(s, 0, vlog_probe_cb, &(vlog_probe){0}) == 0);
+    char vlog[256]; snprintf(vlog, sizeof(vlog), "%s.vlog", p);
+    struct stat st;
+    CHECK(stat(vlog, &st) != 0);
+
+    /* checkpoint still works without a vlog */
+    CHECK(store_checkpoint(s));
+    CHECK(stat(vlog, &st) != 0);
+    store_close(s);
+
+    /* WAL durability is unchanged: reopen (still flagged) sees the data */
+    Store *s2 = store_open_flags(p, POG_OPEN_NO_VLOG);
+    CHECK(s2 != NULL);
+    CHECK(store_version(s2) == 0);
+    Object *back = NULL;
+    for (size_t i = 0; i < s2->count; i++)
+        if (s2->objects[i]->id == a_id) back = s2->objects[i];
+    CHECK(back != NULL);
+    CHECK(back && get_field(back, "name") != NULL);
+    CHECK(back && strcmp(get_field(back, "name")->str_value, "durable") == 0);
+    CHECK(stat(vlog, &st) != 0);
+    store_close(s2);
+
+    /* a later plain store_open bootstraps a fresh .vlog from this point */
+    Store *s3 = store_open(p);
+    CHECK(s3 != NULL);
+    CHECK(store_version(s3) == 0);
+    CHECK(stat(vlog, &st) == 0);
+    new_object(s3);
+    CHECK(store_version(s3) == 1);
+    store_close(s3);
+    rm_both(p);
+}
+
 /* =======================================================
  * Phase 12: Process + thread concurrency
  * ======================================================= */
@@ -3072,6 +3121,7 @@ int main(void)
     test_vlog_ephemeral_always_zero();
     test_vlog_callback_reentrancy_no_deadlock();
     test_vlog_torn_tail_recovery();
+    test_vlog_no_vlog_flag();
 
     test_process_lock();
     test_concurrent_readers_one_writer();

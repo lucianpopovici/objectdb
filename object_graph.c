@@ -3127,6 +3127,11 @@ static bool wal_open_append(Store *s, uint32_t baseline)
 
 Store *store_open(const char *path)
 {
+    return store_open_flags(path, 0);
+}
+
+Store *store_open_flags(const char *path, unsigned flags)
+{
     if (!path) return NULL;
     pog_register_builtins();
 
@@ -3198,7 +3203,14 @@ Store *store_open(const char *path)
     free(wp);
 
     /* 5) Open/bootstrap/scan/truncate .vlog -- separate, dedicated,
-     * never-checkpoint-truncated durable artifact. */
+     * never-checkpoint-truncated durable artifact. Skipped entirely under
+     * POG_OPEN_NO_VLOG: vlog_fp stays NULL, which every vlog writer/reader
+     * already treats as "no change log" (version stays 0). */
+    if (flags & POG_OPEN_NO_VLOG) {
+        if (s->next_id == 0) s->next_id = 1;
+        if (s->next_txn_id == 0) s->next_txn_id = 1;
+        return s;
+    }
     char *vp = path_append(path, ".vlog");
     if (!vp) { store_destroy(s); return NULL; }
 

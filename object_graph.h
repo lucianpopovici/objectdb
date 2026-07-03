@@ -211,8 +211,21 @@ struct Store {
 };
 
 /* --- Lifecycle --- */
+
+/* store_open_flags flags. */
+#define POG_OPEN_NO_VLOG 0x1u
+/* POG_OPEN_NO_VLOG: do not create, scan, or append the <path>.vlog change
+ * log. For high-churn stores (e.g. caches) that never call store_version()/
+ * store_changes_since(), the never-pruned .vlog is pure disk growth. With
+ * this flag store_version() stays 0 and store_changes_since() visits
+ * nothing (matching the ephemeral-store behavior of those APIs); everything
+ * else (WAL durability, crash recovery, checkpoint) is unchanged. The flag
+ * is per-open, not persisted: a later plain store_open() of the same path
+ * bootstraps a fresh .vlog whose version history starts from that point. */
+
 Store *store_create(void);                   /* ephemeral, in-memory only        */
 Store *store_open  (const char *path);       /* persistent: load snap + WAL      */
+Store *store_open_flags(const char *path, unsigned flags); /* see POG_OPEN_*  */
 bool   store_checkpoint(Store *s);           /* fold WAL into snapshot, reset WAL*/
 void   store_close (Store *s);               /* works for both modes             */
 void   store_destroy(Store *s);              /* alias for store_close            */
