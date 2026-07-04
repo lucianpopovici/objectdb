@@ -1,6 +1,5 @@
 /* test_graph.c — v2 test suite */
 #define _POSIX_C_SOURCE 200809L
-#define POG_ENABLE_SHORT_ROOT_NAMES /* test file predates the pog_ prefix */
 #include "object_graph.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -215,11 +214,11 @@ static void test_roots(void)
     Store *s = store_create();
     Object *o = new_object(s);
     set_field(o, "name", new_string(s, "R"));
-    CHECK(bind(s, "main", o));
-    CHECK(get(s, "main") == o);
-    CHECK(get(s, "missing") == NULL);
-    CHECK(unbind(s, "main"));
-    CHECK(get(s, "main") == NULL);
+    CHECK(pog_bind(s, "main", o));
+    CHECK(pog_get(s, "main") == o);
+    CHECK(pog_get(s, "missing") == NULL);
+    CHECK(pog_unbind(s, "main"));
+    CHECK(pog_get(s, "main") == NULL);
     store_destroy(s);
 }
 
@@ -235,11 +234,11 @@ static void test_gc(void)
     set_field(live, "x", new_int(s, 1));
     set_field(dead, "y", new_int(s, 2));  /* dead becomes unreachable after we don't bind */
     (void)dead;
-    bind(s, "R", live);
+    pog_bind(s, "R", live);
     size_t before = s->count;
     gc(s);
     CHECK(s->count < before);
-    CHECK(get(s, "R") == live);
+    CHECK(pog_get(s, "R") == live);
     CHECK(get_field(live, "x")->int_value == 1);
     store_destroy(s);
 }
@@ -357,18 +356,18 @@ static void test_txn_abort_roots(void)
     Store *s = store_create();
     Object *a = new_object(s);
     Object *b = new_object(s);
-    bind(s, "existing", a);
+    pog_bind(s, "existing", a);
 
     txn_begin(s);
-    bind(s, "existing", b);      /* update */
-    bind(s, "newroot", a);       /* new */
-    unbind(s, "existing");       /* then unbind the updated one */
-    CHECK(get(s, "existing") == NULL);
-    CHECK(get(s, "newroot") == a);
+    pog_bind(s, "existing", b);      /* update */
+    pog_bind(s, "newroot", a);       /* new */
+    pog_unbind(s, "existing");       /* then unbind the updated one */
+    CHECK(pog_get(s, "existing") == NULL);
+    CHECK(pog_get(s, "newroot") == a);
     txn_abort(s);
 
-    CHECK(get(s, "existing") == a);
-    CHECK(get(s, "newroot") == NULL);
+    CHECK(pog_get(s, "existing") == a);
+    CHECK(pog_get(s, "newroot") == NULL);
     store_destroy(s);
 }
 
@@ -389,13 +388,13 @@ static void test_snapshot_roundtrip(void)
     list_append(items, new_string(s, "third"));
     set_field(root, "items", items);
     set_field(root, "name", new_string(s, "graph"));
-    bind(s, "ROOT", root);
+    pog_bind(s, "ROOT", root);
     CHECK(save(s, p));
     store_destroy(s);
 
     Store *s2 = load(p);
     CHECK(s2 != NULL);
-    Object *r = get(s2, "ROOT");
+    Object *r = pog_get(s2, "ROOT");
     CHECK(r != NULL);
     CHECK(strcmp(get_field(r, "name")->str_value, "graph") == 0);
     Object *l = get_field(r, "items");
@@ -423,13 +422,13 @@ static void test_bytes_snapshot_roundtrip(void)
     Object *items = new_list(s);
     list_append(items, new_bytes(s, "\x00\x00\x00", 3));
     set_field(root, "items", items);
-    bind(s, "ROOT", root);
+    pog_bind(s, "ROOT", root);
     CHECK(save(s, p));
     store_destroy(s);
 
     Store *s2 = load(p);
     CHECK(s2 != NULL);
-    Object *r = get(s2, "ROOT");
+    Object *r = pog_get(s2, "ROOT");
     CHECK(r != NULL);
     Object *b2 = get_field(r, "blob");
     CHECK(b2 != NULL && b2->kind == OBJ_BYTES);
@@ -458,12 +457,12 @@ static void test_persistent_autocommit(void)
     Object *r = new_object(s);
     set_field(r, "name", new_string(s, "alice"));
     set_field(r, "age", new_int(s, 30));
-    bind(s, "USER", r);
+    pog_bind(s, "USER", r);
     store_close(s);
 
     Store *s2 = store_open(p);
     CHECK(s2 != NULL);
-    Object *r2 = get(s2, "USER");
+    Object *r2 = pog_get(s2, "USER");
     CHECK(r2 != NULL);
     CHECK(strcmp(get_field(r2, "name")->str_value, "alice") == 0);
     CHECK(get_field(r2, "age")->int_value == 30);
@@ -483,12 +482,12 @@ static void test_persistent_explicit_txn(void)
     list_append(l, new_int(s, 100));
     list_append(l, new_int(s, 200));
     list_append(l, new_int(s, 300));
-    bind(s, "LIST", l);
+    pog_bind(s, "LIST", l);
     CHECK(txn_commit(s));
     store_close(s);
 
     Store *s2 = store_open(p);
-    Object *l2 = get(s2, "LIST");
+    Object *l2 = pog_get(s2, "LIST");
     CHECK(l2 != NULL);
     CHECK(list_len(l2) == 3);
     CHECK(list_get(l2, 0)->int_value == 100);
@@ -510,12 +509,12 @@ static void test_persistent_explicit_txn_bytes(void)
     uint8_t v2[] = { 0xBB, 0x00, 0xCC };
     Object *bf = new_bytes(s, v1, sizeof(v1));
     set_bytes(bf, v2, sizeof(v2));
-    bind(s, "BLOB", bf);
+    pog_bind(s, "BLOB", bf);
     CHECK(txn_commit(s));
     store_close(s);
 
     Store *s2 = store_open(p);
-    Object *bf2 = get(s2, "BLOB");
+    Object *bf2 = pog_get(s2, "BLOB");
     CHECK(bf2 != NULL && bf2->kind == OBJ_BYTES);
     CHECK(bytes_len(bf2) == sizeof(v2));
     CHECK(memcmp(bytes_data(bf2), v2, sizeof(v2)) == 0);
@@ -532,7 +531,7 @@ static void test_persistent_abort_not_persisted(void)
     Store *s = store_open(p);
     Object *r = new_object(s);
     set_field(r, "keeper", new_int(s, 1));
-    bind(s, "R", r);
+    pog_bind(s, "R", r);
 
     txn_begin(s);
     set_field(r, "ghost", new_int(s, 999));
@@ -544,7 +543,7 @@ static void test_persistent_abort_not_persisted(void)
     store_close(s);
 
     Store *s2 = store_open(p);
-    Object *r2 = get(s2, "R");
+    Object *r2 = pog_get(s2, "R");
     CHECK(r2 != NULL);
     CHECK(get_field(r2, "keeper") != NULL);
     CHECK(get_field(r2, "keeper")->int_value == 1);
@@ -563,7 +562,7 @@ static void test_checkpoint(void)
     Store *s = store_open(p);
     Object *r = new_object(s);
     set_field(r, "a", new_int(s, 1));
-    bind(s, "ROOT", r);
+    pog_bind(s, "ROOT", r);
 
     /* checkpoint folds current state into snapshot */
     CHECK(store_checkpoint(s));
@@ -575,7 +574,7 @@ static void test_checkpoint(void)
 
     /* Reopen: should load snapshot + replay post-checkpoint WAL */
     Store *s2 = store_open(p);
-    Object *r2 = get(s2, "ROOT");
+    Object *r2 = pog_get(s2, "ROOT");
     CHECK(r2 != NULL);
     CHECK(get_field(r2, "a") != NULL && get_field(r2, "a")->int_value == 1);
     CHECK(get_field(r2, "b") != NULL && get_field(r2, "b")->int_value == 2);
@@ -593,19 +592,19 @@ static void test_multiple_reopens(void)
     /* cycle 1: create root */
     Store *s1 = store_open(p);
     Object *r = new_object(s1);
-    bind(s1, "R", r);
+    pog_bind(s1, "R", r);
     store_close(s1);
 
     /* cycle 2: add fields */
     Store *s2 = store_open(p);
-    r = get(s2, "R");
+    r = pog_get(s2, "R");
     CHECK(r != NULL);
     set_field(r, "x", new_int(s2, 10));
     store_close(s2);
 
     /* cycle 3: checkpoint + add more */
     Store *s3 = store_open(p);
-    r = get(s3, "R");
+    r = pog_get(s3, "R");
     CHECK(get_field(r, "x")->int_value == 10);
     CHECK(store_checkpoint(s3));
     set_field(r, "y", new_int(s3, 20));
@@ -613,7 +612,7 @@ static void test_multiple_reopens(void)
 
     /* cycle 4: verify all */
     Store *s4 = store_open(p);
-    r = get(s4, "R");
+    r = pog_get(s4, "R");
     CHECK(r != NULL);
     CHECK(get_field(r, "x")->int_value == 10);
     CHECK(get_field(r, "y")->int_value == 20);
@@ -631,7 +630,7 @@ static void test_torn_wal_tail(void)
     Store *s = store_open(p);
     Object *r = new_object(s);
     set_field(r, "survivor", new_int(s, 42));
-    bind(s, "R", r);
+    pog_bind(s, "R", r);
     store_close(s);   /* cleanly flushes and fsyncs */
 
     /* simulate partial write: append garbage bytes that look like half a record */
@@ -645,7 +644,7 @@ static void test_torn_wal_tail(void)
     /* recovery should ignore torn tail and restore previous state */
     Store *s2 = store_open(p);
     CHECK(s2 != NULL);
-    Object *r2 = get(s2, "R");
+    Object *r2 = pog_get(s2, "R");
     CHECK(r2 != NULL);
     CHECK(get_field(r2, "survivor") != NULL);
     CHECK(get_field(r2, "survivor")->int_value == 42);
@@ -666,7 +665,7 @@ static void test_bytes_torn_wal_tail(void)
     Object *bf = new_bytes(s, v1, sizeof(v1));       /* WOP_NEW_BYTES */
     set_field(r, "blob", bf);
     set_bytes(bf, v2, sizeof(v2));                    /* WOP_SET_BYTES */
-    bind(s, "R", r);
+    pog_bind(s, "R", r);
     store_close(s);   /* cleanly flushes and fsyncs */
 
     char wal[256]; snprintf(wal, sizeof(wal), "%s.wal", p);
@@ -678,7 +677,7 @@ static void test_bytes_torn_wal_tail(void)
 
     Store *s2 = store_open(p);
     CHECK(s2 != NULL);
-    Object *r2 = get(s2, "R");
+    Object *r2 = pog_get(s2, "R");
     CHECK(r2 != NULL);
     Object *bf2 = get_field(r2, "blob");
     CHECK(bf2 != NULL && bf2->kind == OBJ_BYTES);
@@ -707,11 +706,11 @@ static void test_persistent_complex_graph(void)
         set_field(u, "shared", shared);    /* all point to same */
         list_append(users, u);
     }
-    bind(s, "USERS", users);
+    pog_bind(s, "USERS", users);
     store_close(s);
 
     Store *s2 = store_open(p);
-    Object *ul = get(s2, "USERS");
+    Object *ul = pog_get(s2, "USERS");
     CHECK(ul != NULL);
     CHECK(list_len(ul) == 5);
 
@@ -744,11 +743,11 @@ static void test_persistent_complex_graph_bytes(void)
         set_field(u, "shared", shared);
         list_append(users, u);
     }
-    bind(s, "USERS", users);
+    pog_bind(s, "USERS", users);
     store_close(s);
 
     Store *s2 = store_open(p);
-    Object *ul = get(s2, "USERS");
+    Object *ul = pog_get(s2, "USERS");
     CHECK(ul != NULL);
     CHECK(list_len(ul) == 5);
 
@@ -954,7 +953,7 @@ static void test_vlist_gc_keeps_params_alive(void)
     set_field(net, "prefix", new_string(s, "10.0.0.0"));
     set_field(net, "bits",   new_int(s, 28));
     Object *v = new_vlist(s, "cidr.all", net);
-    bind(s, "VIEW", v);
+    pog_bind(s, "VIEW", v);
 
     size_t before = s->count;
     gc(s);
@@ -962,7 +961,7 @@ static void test_vlist_gc_keeps_params_alive(void)
      * must survive: nothing should be freed. */
     CHECK(s->count == before);
     /* And view still works */
-    Object *v2 = get(s, "VIEW");
+    Object *v2 = pog_get(s, "VIEW");
     CHECK(list_len(v2) == 14);
     store_destroy(s);
 }
@@ -983,13 +982,13 @@ static void test_vlist_persist_save_load(void)
 
     set_field(net, "all",  new_vlist(s, "cidr.all",  net));
     set_field(net, "free", new_vlist(s, "cidr.free", net));
-    bind(s, "NET", net);
+    pog_bind(s, "NET", net);
     CHECK(save(s, p));
     store_destroy(s);
 
     Store *s2 = load(p);
     CHECK(s2 != NULL);
-    Object *net2 = get(s2, "NET");
+    Object *net2 = pog_get(s2, "NET");
     CHECK(net2 != NULL);
     Object *all2  = get_field(net2, "all");
     Object *free2 = get_field(net2, "free");
@@ -1018,13 +1017,13 @@ static void test_vlist_persist_wal(void)
     list_append(assigned, new_string(s, "192.168.1.7"));
     set_field(net, "assigned", assigned);
     set_field(net, "free", new_vlist(s, "cidr.free", net));
-    bind(s, "NET", net);
+    pog_bind(s, "NET", net);
     store_close(s);
 
     /* reopen — state comes from WAL replay (no checkpoint was called) */
     Store *s2 = store_open(p);
     CHECK(s2 != NULL);
-    Object *net2 = get(s2, "NET");
+    Object *net2 = pog_get(s2, "NET");
     CHECK(net2 != NULL);
     Object *free2 = get_field(net2, "free");
     CHECK(free2 && free2->kind == OBJ_VLIST);
@@ -1055,7 +1054,7 @@ static void test_vlist_persist_checkpoint(void)
     Object *assigned = new_list(s);
     set_field(net, "assigned", assigned);
     set_field(net, "free", new_vlist(s, "cidr.free", net));
-    bind(s, "NET", net);
+    pog_bind(s, "NET", net);
 
     CHECK(store_checkpoint(s));   /* fold into snapshot */
 
@@ -1063,7 +1062,7 @@ static void test_vlist_persist_checkpoint(void)
     store_close(s);
 
     Store *s2 = store_open(p);
-    Object *net2 = get(s2, "NET");
+    Object *net2 = pog_get(s2, "NET");
     Object *free2 = get_field(net2, "free");
     CHECK(list_len(free2) == 13);
     CHECK(!contains_str(free2, "10.0.0.2"));
@@ -1363,11 +1362,11 @@ static void test_vlist_v6_persist(void)
     list_append(assigned, new_string(s, "2001:db8:cafe::1"));
     set_field(net, "assigned", assigned);
     set_field(net, "free", new_vlist(s, "cidr.free", net));
-    bind(s, "NET", net);
+    pog_bind(s, "NET", net);
     store_close(s);
 
     Store *s2 = store_open(path);
-    Object *net2 = get(s2, "NET");
+    Object *net2 = pog_get(s2, "NET");
     Object *free2 = get_field(net2, "free");
     CHECK(list_len(free2) == 1);
     CHECK(strcmp(list_get(free2, 0)->str_value, "2001:db8:cafe::2") == 0);
@@ -1506,7 +1505,7 @@ static void test_class_gc(void)
     SECTION("class: GC removes collected instances from index");
     Store *s = store_create();
     Object *root = new_object(s);
-    bind(s, "R", root);
+    pog_bind(s, "R", root);
     set_class(root, "Root");
 
     /* Orphan tagged objects (not reachable from R) */
@@ -1521,7 +1520,7 @@ static void test_class_gc(void)
     CHECK(class_size(s, "Root") == 1);
     CHECK(class_size(s, "Orphan") == 0);
     /* Root still retrievable and still tagged */
-    CHECK(strcmp(class_of(get(s, "R")), "Root") == 0);
+    CHECK(strcmp(class_of(pog_get(s, "R")), "Root") == 0);
     store_destroy(s);
 }
 
@@ -1539,7 +1538,7 @@ static void test_class_persistence(void)
     set_class(b, "Alpha");
     set_class(c, "Beta");
     set_field(a, "name", new_string(s, "a1"));
-    bind(s, "A", a); bind(s, "B", b); bind(s, "C", c);
+    pog_bind(s, "A", a); pog_bind(s, "B", b); pog_bind(s, "C", c);
     CHECK(save(s, p));
     store_destroy(s);
 
@@ -1547,7 +1546,7 @@ static void test_class_persistence(void)
     CHECK(s2 != NULL);
     CHECK(class_size(s2, "Alpha") == 2);
     CHECK(class_size(s2, "Beta")  == 1);
-    Object *a2 = get(s2, "A");
+    Object *a2 = pog_get(s2, "A");
     CHECK(a2 != NULL);
     CHECK(strcmp(class_of(a2), "Alpha") == 0);
     store_destroy(s2);
@@ -1563,7 +1562,7 @@ static void test_class_wal(void)
     Store *s = store_open(p);
     Object *a = new_object(s);
     set_class(a, "Initial");
-    bind(s, "A", a);
+    pog_bind(s, "A", a);
     CHECK(class_size(s, "Initial") == 1);
     set_class(a, "Changed");
     CHECK(class_size(s, "Initial") == 0);
@@ -1573,7 +1572,7 @@ static void test_class_wal(void)
     Store *s2 = store_open(p);
     CHECK(class_size(s2, "Initial") == 0);
     CHECK(class_size(s2, "Changed") == 1);
-    Object *a2 = get(s2, "A");
+    Object *a2 = pog_get(s2, "A");
     CHECK(strcmp(class_of(a2), "Changed") == 0);
     store_close(s2);
     rm_both(p);
@@ -1751,7 +1750,7 @@ static void test_index_gc(void)
     SECTION("index: maintained across GC");
     Store *s = store_create();
     Object *root = new_object(s);
-    bind(s, "R", root);
+    pog_bind(s, "R", root);
     Object *live = new_object(s);
     set_field(root, "live", live);
     set_class(live, "Item");
@@ -1810,14 +1809,14 @@ static void test_index_not_persisted(void)
     Store *s = store_open(p);
     Object *a = new_object(s); set_class(a, "User");
     set_field(a, "email", new_string(s, "a@example.com"));
-    bind(s, "A", a);
+    pog_bind(s, "A", a);
     CHECK(index_create(s, "User", "email"));
     CHECK(index_lookup_one(s, "User", "email", "a@example.com") == a);
     store_close(s);
 
     Store *s2 = store_open(p);
     CHECK(index_lookup_one(s2, "User", "email", "a@example.com") == NULL);
-    Object *a2 = get(s2, "A");
+    Object *a2 = pog_get(s2, "A");
     CHECK(find_by_field(s2, "User", "email", "a@example.com") == a2);
 
     CHECK(index_create(s2, "User", "email"));
@@ -2112,7 +2111,7 @@ static void test_ord_index_gc(void)
     SECTION("ord index: maintained across GC");
     Store *s = store_create();
     Object *root = new_object(s);
-    bind(s, "R", root);
+    pog_bind(s, "R", root);
     Object *live = new_object(s);
     set_field(root, "live", live);
     set_class(live, "RR");
@@ -2172,14 +2171,14 @@ static void test_ord_index_not_persisted(void)
 
     Store *s = store_open(p);
     Object *a = mk_rr(s, "a.example.com");
-    bind(s, "A", a);
+    pog_bind(s, "A", a);
     CHECK(ord_index_create(s, "RR", "name"));
     CHECK(index_pred(s, "RR", "name", "z") == a);
     store_close(s);
 
     Store *s2 = store_open(p);
     CHECK(index_pred(s2, "RR", "name", "z") == NULL);
-    Object *a2 = get(s2, "A");
+    Object *a2 = pog_get(s2, "A");
     CHECK(ord_index_create(s2, "RR", "name"));
     CHECK(index_pred(s2, "RR", "name", "z") == a2);
     store_close(s2);
@@ -2327,13 +2326,13 @@ static void test_dns_vlist_persist_save_load(void)
     set_field(rr, "name", new_string(s, "www.example.com"));
     set_field(rr, "ancestors", new_vlist(s, "dns.ancestors", rr));
     set_field(rr, "wildcards", new_vlist(s, "dns.wildcards", rr));
-    bind(s, "RR", rr);
+    pog_bind(s, "RR", rr);
     CHECK(save(s, p));
     store_destroy(s);
 
     Store *s2 = load(p);
     CHECK(s2 != NULL);
-    Object *rr2 = get(s2, "RR");
+    Object *rr2 = pog_get(s2, "RR");
     CHECK(rr2 != NULL);
     Object *anc2 = get_field(rr2, "ancestors");
     Object *wc2  = get_field(rr2, "wildcards");
@@ -2358,12 +2357,12 @@ static void test_dns_vlist_persist_wal(void)
     Object *rr = new_object(s);
     set_field(rr, "name", new_string(s, "foo.bar.example.com"));
     set_field(rr, "wildcards", new_vlist(s, "dns.wildcards", rr));
-    bind(s, "RR", rr);
+    pog_bind(s, "RR", rr);
     store_close(s);
 
     Store *s2 = store_open(p);
     CHECK(s2 != NULL);
-    Object *rr2 = get(s2, "RR");
+    Object *rr2 = pog_get(s2, "RR");
     CHECK(rr2 != NULL);
     Object *wc2 = get_field(rr2, "wildcards");
     CHECK(wc2 && wc2->kind == OBJ_VLIST);
@@ -2619,14 +2618,14 @@ static void test_vlog_root_only_txn_no_bump(void)
     Object *a = new_object(s);
     uint32_t v_before = store_version(s);
 
-    CHECK(bind(s, "ROOT", a));
+    CHECK(pog_bind(s, "ROOT", a));
     CHECK(store_version(s) == v_before);
-    CHECK(unbind(s, "ROOT"));
+    CHECK(pog_unbind(s, "ROOT"));
     CHECK(store_version(s) == v_before);
 
     txn_begin(s);
-    bind(s, "ROOT2", a);
-    unbind(s, "ROOT2");
+    pog_bind(s, "ROOT2", a);
+    pog_unbind(s, "ROOT2");
     txn_commit(s);
     CHECK(store_version(s) == v_before);
 
@@ -2760,7 +2759,7 @@ static void test_vlog_callback_reentrancy_no_deadlock(void)
     Store *s = store_open(p);
     Object *a = new_object(s);
     set_class(a, "Widget");
-    bind(s, "W", a);
+    pog_bind(s, "W", a);
 
     size_t visited = store_changes_since(s, 0, vlog_reentrant_cb, s);
     CHECK(visited >= 1);
@@ -2938,7 +2937,7 @@ static void test_concurrent_readers_one_writer(void)
     SECTION("concurrency: N readers + 1 writer don't crash or race");
     Store *s = store_create();
     Object *list = new_list(s);
-    bind(s, "L", list);
+    pog_bind(s, "L", list);
 
     /* pre-fill a bit so readers have something to see */
     for (int i = 0; i < 10; i++) list_append(list, new_int(s, -i));
@@ -2981,7 +2980,7 @@ static void test_concurrent_writers_serialize(void)
     SECTION("concurrency: concurrent writers serialize via rwlock");
     Store *s = store_create();
     Object *list = new_list(s);
-    bind(s, "L", list);
+    pog_bind(s, "L", list);
 
     enum { ITERS = 500 };
     pthread_t t1, t2;
