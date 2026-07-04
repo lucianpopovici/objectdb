@@ -1,5 +1,6 @@
 /* test_graph.c — v2 test suite */
 #define _POSIX_C_SOURCE 200809L
+#define POG_ENABLE_SHORT_ROOT_NAMES /* test file predates the pog_ prefix */
 #include "object_graph.h"
 #include <stdio.h>
 #include <stdlib.h>

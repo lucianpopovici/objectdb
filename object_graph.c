@@ -4081,10 +4081,10 @@ bool list_remove(Object *l, size_t i) {
     LOCK_W(s); bool r = list_remove_unlocked(l, i); UNLOCK_W(s); return r;
 }
 
-bool bind(Store *s, const char *n, Object *o) {
+bool pog_bind(Store *s, const char *n, Object *o) {
     LOCK_W(s); bool r = bind_unlocked(s, n, o); UNLOCK_W(s); return r;
 }
-bool unbind(Store *s, const char *n) {
+bool pog_unbind(Store *s, const char *n) {
     LOCK_W(s); bool r = unbind_unlocked(s, n); UNLOCK_W(s); return r;
 }
 
@@ -4122,7 +4122,7 @@ size_t list_len(Object *l) {
     Store *s = l ? l->store : NULL;
     LOCK_R(s); size_t r = list_len_unlocked(l); UNLOCK_R(s); return r;
 }
-Object *get(Store *s, const char *n) {
+Object *pog_get(Store *s, const char *n) {
     LOCK_R(s); Object *r = get_unlocked(s, n); UNLOCK_R(s); return r;
 }
 
